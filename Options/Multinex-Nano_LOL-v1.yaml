@@ -52,6 +52,7 @@ datasets:
 # network structures
 network_g:
   type: MultinexNano
+  use_haar_edge_illum: true
   # arch_module: basicsr.models.archs.RetinexMSEFMultiLum_arch   # (optional) set if file/module name differs
 
   # --- I/O ---

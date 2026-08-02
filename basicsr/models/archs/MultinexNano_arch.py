@@ -380,6 +380,81 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
+
+
+
+class HaarDWT2D(nn.Module):
+    """Parameter-free 2D Haar DWT on a single-channel input.
+
+    Input:  (B,1,H,W)
+    Output: LL, HL, LH, HH each (B,1,H/2,W/2)
+    """
+    def __init__(self):
+        super().__init__()
+        # 2x2 blocks: a=top-left, b=top-right, c=bottom-left, d=bottom-right
+        k = torch.tensor([
+            [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
+            [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
+            [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
+            [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
+        ], dtype=torch.float32)  # (4,1,2,2)
+        self.register_buffer("kernel", k)
+
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        assert C == 1, "HaarDWT2D expects a single-channel input"
+        pad_h, pad_w = H % 2, W % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+        out = F.conv2d(x, self.kernel, stride=2)  # (B,4,H/2,W/2)
+        LL, HL, LH, HH = out[:, 0:1], out[:, 1:2], out[:, 2:3], out[:, 3:4]
+        return LL, HL, LH, HH
+
+
+class HaarEdgeIllumination(nn.Module):
+    """
+    Y_vmax = max(R,G,B)
+    LL,HL,LH,HH = Haar_DWT(Y_vmax)
+    Delta_L_base = conv3x3(LL)                                (half-res)
+    M_edge       = sigmoid(conv3x3(|HL|+|LH|+|HH|))           (half-res)
+    Delta_L = conv3x3(Upsample(Delta_L_base)) * (1 + Upsample(M_edge))
+
+    Ultra-lightweight: three single-channel 3x3 convs (~9+1 params each).
+    """
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dwt = HaarDWT2D()
+        self.base_conv    = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
+        self.edge_conv    = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
+        self.post_up_conv = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        assert C == 3, "HaarEdgeIllumination expects RGB input (B,3,H,W)"
+
+        R, G, Bc = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+        y_vmax = torch.maximum(R, torch.maximum(G, Bc))
+
+        LL, HL, LH, HH = self.dwt(y_vmax)
+
+        delta_L_base = self.base_conv(LL)
+        edge_energy = HL.abs() + LH.abs() + HH.abs()
+        m_edge = torch.sigmoid(self.edge_conv(edge_energy))
+
+        delta_L_base_up = F.interpolate(delta_L_base, size=(H, W), mode='bilinear', align_corners=False)
+        m_edge_up = F.interpolate(m_edge, size=(H, W), mode='bilinear', align_corners=False)
+
+        delta_L = self.post_up_conv(delta_L_base_up) * (1.0 + m_edge_up)
+        return delta_L
+
+
+
+
+
+
+
+
 class MultinexNano(nn.Module):
     """
     RetinexMSEFMultiLum with direct (non-gating) attention application and 3-stage block layout:
@@ -391,35 +466,35 @@ class MultinexNano(nn.Module):
     All previous knobs preserved; new knobs add maximum flexibility.
     """
     def __init__(self,
-                 in_ch: int = 3,
-                 out_ch: int = 3,
-                 base_channels: int = 32,
-                 use_depthwise: bool = True,
-                 per_illum_proj: bool = True,
-                 reduction_ratio: int = 16,
-                 width_mult: float = 1.0,
-                 target_params: Optional[int] = None,
-                 illum_flags: Optional[Dict[str, bool]] = None,
-                 act=nn.SiLU,
+             in_ch: int = 3,
+             out_ch: int = 3,
+             base_channels: int = 32,
+             use_depthwise: bool = True,
+             per_illum_proj: bool = True,
+             reduction_ratio: int = 16,
+             width_mult: float = 1.0,
+             target_params: Optional[int] = None,
+             illum_flags: Optional[Dict[str, bool]] = None,
+             act=nn.SiLU,
 
-                 chroma_flags: Optional[Dict[str, bool]] = None,
-                 per_chroma_proj: bool = True,
+             chroma_flags: Optional[Dict[str, bool]] = None,
+             per_chroma_proj: bool = True,
 
-                 use_illum_attn: bool = True,
-                 use_chroma_attn: bool = True,
+             use_illum_attn: bool = True,
+             use_chroma_attn: bool = True,
 
-                 illum_mid: int = 1,
-                 chroma_mid: int = 1,
+             illum_mid: int = 1,
+             chroma_mid: int = 1,
 
-                 # Heads & fusion
-                 luma_head_act: Optional[str] = 'sigmoid',
-                 chroma_head_act: Optional[str] = 'tanh',
-                 retinex_residual: bool = True,
-                 eps: float = 1e-6
-                 ):
+             # Heads & fusion
+             luma_head_act: Optional[str] = 'sigmoid',
+             chroma_head_act: Optional[str] = 'tanh',
+             retinex_residual: bool = True,
+             eps: float = 1e-6,
+
+             use_haar_edge_illum: bool = False,   # <-- NEW
+             ):
         super().__init__()
-
-        # ---- store knobs
         self.use_depthwise = use_depthwise
         self.per_illum_proj = per_illum_proj
         self.per_chroma_proj = per_chroma_proj
@@ -434,6 +509,7 @@ class MultinexNano(nn.Module):
 
         self.use_illum_attn = use_illum_attn
         self.use_chroma_attn = use_chroma_attn
+        self.use_haar_edge_illum = use_haar_edge_illum   # <-- NEW
 
         # ---- extractors
         self.illum_extractor = IlluminationExtractor(illum_flags)
@@ -451,36 +527,48 @@ class MultinexNano(nn.Module):
         self.C = C
 
         # ---- stems
-        self.illum_stem  = nn.Conv2d(max(1, K_L), C, kernel_size=1, bias=True)
         self.chroma_stem = nn.Conv2d(max(1, K_C), C, kernel_size=1, bias=True)
 
-        # ---- attention modules per branch (produce (B,K, H, W))
-        self.illum_att = nn.Conv2d(max(1, K_L), max(1, K_L), kernel_size=7, stride=1, padding=3, groups=max(1, K_L), bias=True)
-        self.chroma_att = nn.Conv2d(max(1, K_C), max(1, K_C), kernel_size=7, stride=1, padding=3, groups=max(1, K_C), bias=True)
-        
-        # ---- attention projection K->C per branch
-        if self.per_illum_proj:
-            self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,K_L))])
+        if self.use_haar_edge_illum:
+            # ---- lightweight wavelet illumination branch (replaces illum_* trunk)
+            self.haar_illum = HaarEdgeIllumination(eps=eps)
+            # keep illum_stem/att/proj as unused None to avoid attribute errors elsewhere
+            self.illum_stem = None
+            self.illum_att = None
+            self.illum_att_proj = None
+            self.illum_mid_seq = None
         else:
-            self.illum_att_proj = nn.Conv2d(max(1,K_L), C, 1, 1, 0, bias=True)
+            self.illum_stem  = nn.Conv2d(max(1, K_L), C, kernel_size=1, bias=True)
+
+            # ---- attention modules per branch (produce (B,K, H, W))
+            self.illum_att = nn.Conv2d(max(1, K_L), max(1, K_L), kernel_size=7, stride=1, padding=3, groups=max(1, K_L), bias=True)
+
+            # ---- attention projection K->C per branch
+            if self.per_illum_proj:
+                self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,K_L))])
+            else:
+                self.illum_att_proj = nn.Conv2d(max(1,K_L), C, 1, 1, 0, bias=True)
+
+            self.illum_mid_seq = self._make_stack_blocks(C, C, depth=illum_mid)
+
+        self.chroma_att = nn.Conv2d(max(1, K_C), max(1, K_C), kernel_size=7, stride=1, padding=3, groups=max(1, K_C), bias=True)
 
         if self.per_chroma_proj:
             self.chroma_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,K_C))])
         else:
             self.chroma_att_proj = nn.Conv2d(max(1,K_C), C, 1, 1, 0, bias=True)
 
-        # ---- blocks: (pre -> mid -> post) per 
-        self.illum_mid_seq  = self._make_stack_blocks(C, C, depth=illum_mid)
+        self.chroma_mid_seq = self._make_stack_blocks(C, C, depth=chroma_mid)
 
-        self.chroma_mid_seq  = self._make_stack_blocks(C, C, depth=chroma_mid)
         # ---- heads
-        self.head_luma   = nn.Conv2d(C, 1, kernel_size=1, bias=True)
-        self.head_chroma = nn.Conv2d(C, out_ch, kernel_size=1, bias=True)  # typically to 3
+        if not self.use_haar_edge_illum:
+            self.head_luma = nn.Conv2d(C, 1, kernel_size=1, bias=True)
+        self.head_chroma = nn.Conv2d(C, out_ch, kernel_size=1, bias=True)
 
         # ---- optional param budget auto-shrink
         if target_params is not None:
             self._fit_param_budget(target_params, in_ch, out_ch)
-
+`
     # ---- helpers (unchanged except we don’t build BN/act gates now)
     def _make_block(self, c_in, c_out):
         if self.use_depthwise:
@@ -517,7 +605,6 @@ class MultinexNano(nn.Module):
         return x
 
     def _fit_param_budget(self, target_params: int, in_ch: int, out_ch: int):
-        # Rebuild all C-dependent parts when shrinking width
         lo, hi = 0.25, self.width_mult
         best = self.width_mult
         for _ in range(10):
@@ -525,28 +612,22 @@ class MultinexNano(nn.Module):
             self.width_mult = mid
             C = max(3, int(round(self.base_channels * self.width_mult)))
             self.C = C
-            print(f'self.C = {self.C}')
 
-            # stems
-            self.illum_stem  = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
             self.chroma_stem = nn.Conv2d(max(1,self.K_C), C, 1, 1, 0, bias=True)
 
-            # blocks
-            # self.illum_pre_seq  = self._make_stack_blocks(C, C, depth=self.illum_mid_seq.__len__() if isinstance(self.illum_mid_seq, nn.Sequential) else 0)
-            self.illum_mid_seq  = self._make_stack_blocks(C, C, depth=self.illum_mid_seq.__len__() if isinstance(self.illum_mid_seq, nn.Sequential) else 0)
+            if not self.use_haar_edge_illum:
+                self.illum_stem  = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
+                self.illum_mid_seq = self._make_stack_blocks(
+                    C, C, depth=self.illum_mid_seq.__len__() if isinstance(self.illum_mid_seq, nn.Sequential) else 0)
+                if self.per_illum_proj:
+                    self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,self.K_L))])
+                else:
+                    self.illum_att_proj = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
+                self.head_luma = nn.Conv2d(C, 1, kernel_size=1, bias=True)
 
-            # self.chroma_pre_seq  = self._make_stack_blocks(C, C, depth=self.chroma_mid_seq.__len__() if isinstance(self.illum_mid_seq, nn.Sequential) else 0)
-            self.chroma_mid_seq  = self._make_stack_blocks(C, C, depth=self.chroma_mid_seq.__len__() if isinstance(self.chroma_mid_seq, nn.Sequential) else 0)
-
-            # heads
-            self.head_luma   = nn.Conv2d(C, 1, kernel_size=1, bias=True)
+            self.chroma_mid_seq = self._make_stack_blocks(
+                C, C, depth=self.chroma_mid_seq.__len__() if isinstance(self.chroma_mid_seq, nn.Sequential) else 0)
             self.head_chroma = nn.Conv2d(C, out_ch, kernel_size=1, bias=True)
-
-            # attn projections K->C
-            if self.per_illum_proj:
-                self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,self.K_L))])
-            else:
-                self.illum_att_proj = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
 
             if self.per_chroma_proj:
                 self.chroma_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,self.K_C))])
@@ -565,49 +646,42 @@ class MultinexNano(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H_init, W_init = x.shape
         rgb_in = x
-
         B, Cin, H, W = x.shape
 
-        # Stacks
-        L_stack = self.illum_extractor(x)   # (B,K_L,H,W) or (B,0,.,.)
-        if L_stack.shape[1] == 0:
-            L_stack = x.new_zeros(B,1,H,W)
-        C_stack = self.chroma_extractor(x)  # (B,K_C,H,W) or (B,0,.,.)
+        C_stack = self.chroma_extractor(x)
         if C_stack.shape[1] == 0:
             C_stack = x.new_zeros(B,1,H,W)
 
-        # Stems
-        fL = self.illum_stem(L_stack)       # (B,C,H,W)
-        fC = self.chroma_stem(C_stack)      # (B,C,H,W)
-
-        if self.use_illum_attn:
-            L_att = self.illum_att(L_stack)                       # (B,K_L,H,W)
-            L_mask = torch.sigmoid(self._att_project_to_C(L_att, self.illum_att_proj))  # (B,C,H,W)
-            fL = fL * L_mask
-        fL = self.illum_mid_seq(fL)
+        fC = self.chroma_stem(C_stack)
 
         if self.use_chroma_attn:
-            C_att = self.chroma_att(C_stack)                      # (B,K_C,H,W)
-            C_mask = torch.sigmoid(self._att_project_to_C(C_att, self.chroma_att_proj))  # (B,C,H,W)
+            C_att = self.chroma_att(C_stack)
+            C_mask = torch.sigmoid(self._att_project_to_C(C_att, self.chroma_att_proj))
             fC = fC * C_mask
         fC = self.chroma_mid_seq(fC)
 
-        # Heads
-        L_hat = self.head_luma(fL)                                # (B,1,H,W)
-        C_hat = self.head_chroma(fC)                              # (B,out_ch,H,W)
+        if self.use_haar_edge_illum:
+            L_hat = self.haar_illum(rgb_in)                       # (B,1,H,W)
+        else:
+            L_stack = self.illum_extractor(x)
+            if L_stack.shape[1] == 0:
+                L_stack = x.new_zeros(B,1,H,W)
+            fL = self.illum_stem(L_stack)
+            if self.use_illum_attn:
+                L_att = self.illum_att(L_stack)
+                L_mask = torch.sigmoid(self._att_project_to_C(L_att, self.illum_att_proj))
+                fL = fL * L_mask
+            fL = self.illum_mid_seq(fL)
+            L_hat = self.head_luma(fL)
+            L_hat = self._apply_head_act(L_hat, self.luma_head_act)
 
-        # Optional head activations (range controls)
-        L_hat = self._apply_head_act(L_hat, self.luma_head_act)
+        C_hat = self.head_chroma(fC)
         C_hat = self._apply_head_act(C_hat, self.chroma_head_act)
 
-        # Retinex fusion and residual
-        out = C_hat * L_hat        
-        
+        out = C_hat * L_hat
         if self.retinex_residual:
             out = out + rgb_in
-
         return out
-
     def param_count(self) -> int:
         return count_params(self)
     
