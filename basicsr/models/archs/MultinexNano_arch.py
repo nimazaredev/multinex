@@ -427,7 +427,7 @@ class HaarEdgeIllumination(nn.Module):
         
         # 3. Final Fusion (Dynamic channel weighting)
         self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        nn.init.constant_(self.fuse_conv.weight, 0.0)
+        nn.init.kaiming_normal_(self.fuse_conv.weight, mode='fan_out', nonlinearity='relu')
         nn.init.constant_(self.fuse_conv.bias, 0.0)
 
     def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
