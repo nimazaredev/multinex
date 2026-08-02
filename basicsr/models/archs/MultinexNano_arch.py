@@ -380,22 +380,18 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
-
 class HaarDWT2D(nn.Module):
-    """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups.
-    """
+    """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups."""
     def __init__(self, in_channels: int = 1):
         super().__init__()
         self.groups = in_channels
-        # 2x2 blocks for Haar Transform
         k = torch.tensor([
             [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
             [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
             [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
             [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
-        ], dtype=torch.float32)  # (4, 1, 2, 2)
+        ], dtype=torch.float32)
         
-        # Repeat kernel for multiple channels (e.g., 4 channels -> 16 filters)
         k = k.repeat(in_channels, 1, 1, 1)
         self.register_buffer("kernel", k)
 
@@ -405,9 +401,7 @@ class HaarDWT2D(nn.Module):
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
             
-        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups) # (B, 4*C, H/2, W/2)
-        
-        # Reshape to (B, C, 4, H/2, W/2) for easy slicing
+        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups)
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
         LL = out[:, :, 0]
         HL = out[:, :, 1]
@@ -417,51 +411,47 @@ class HaarDWT2D(nn.Module):
 
 
 class HaarEdgeIllumination(nn.Module):
-    """
-    Hybrid Wavelet-Multinex Illumination:
-    Applies Haar DWT over the full Multinex L_stack (e.g., 4 channels).
-    Total Params for 4 channels: (3x3x4) + (1x1x4) = 36 + 4 = 40 parameters.
-    """
     def __init__(self, in_channels: int = 4, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.dwt = HaarDWT2D(in_channels=in_channels)
         
-        # DWConv for spatial smoothing per channel (3x3, groups=in_channels, no bias)
+        # DWConv for spatial smoothing per channel
         self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
-        # Smart Initialization: acts as an average pool initially
         nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
         
         # 1x1 Conv to fuse the 4 priors into 1 illumination map
-        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=False)
-        # Smart Initialization: simple channel averaging initially
-        nn.init.constant_(self.fuse_conv.weight, 1.0 / in_channels)
+        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
+        
+        # Zero-Initialization for Additive Residual Learning
+        # This ensures the network starts by predicting Delta_L ~ 0
+        nn.init.constant_(self.fuse_conv.weight, 0.0)
+        nn.init.constant_(self.fuse_conv.bias, 0.0)
 
     def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # L_stack is now (B, 4, H, W) directly from illum_extractor
         B, C, H, W = L_stack.shape
 
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        # Edge Energy (B, 4, H/2, W/2)
+        # Edge Energy
         edge_energy = HL.abs() + LH.abs() + HH.abs()
 
-        # Upsample back to original resolution
+        # Upsampling
         LL_up = F.interpolate(LL, size=(H, W), mode='bilinear', align_corners=False)
         edge_up = F.interpolate(edge_energy, size=(H, W), mode='bilinear', align_corners=False)
 
-        # Modulate Base with Edges
+        # 1. Smooth the base illumination FIRST (Matching proposal math)
+        LL_smoothed = self.dw_conv(LL_up)
+
+        # 2. Modulate with Edges SECOND to preserve sharpness
         m_edge = torch.sigmoid(edge_up)
-        f_modulated = LL_up * (1.0 + m_edge)
+        f_modulated = LL_smoothed * (1.0 + m_edge)
 
-        # Smooth and Fuse
-        delta_L_raw = self.dw_conv(f_modulated)       # (B, 4, H, W)
-        delta_L_fused = self.fuse_conv(delta_L_raw)   # (B, 1, H, W)
+        # 3. Fuse to single channel
+        delta_L = self.fuse_conv(f_modulated)
         
-        # Bounding final illumination
-        delta_L = torch.sigmoid(delta_L_fused)
+        # CRITICAL FIX: No Sigmoid here! Allow Delta_L to be negative for flexible residual learning.
         return delta_L
-
 
 
 
