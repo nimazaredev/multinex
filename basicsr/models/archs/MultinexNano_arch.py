@@ -380,6 +380,7 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
+# RGB  - PSNR: 17.8132
 
 class HaarDWT2D(nn.Module):
     def __init__(self, in_channels: int = 1):
