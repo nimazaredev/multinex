@@ -383,15 +383,11 @@ class ChrominanceExtractor(nn.Module):
 
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class HaarDWT2D(nn.Module):
     def __init__(self, in_channels: int = 1):
         super().__init__()
         self.groups = in_channels
-        # تبدیل هار کاملاً ثابت و بدون پارامتر یادگیرنده باقی ماند
         k = torch.tensor([
             [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
             [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
@@ -413,59 +409,64 @@ class HaarDWT2D(nn.Module):
         return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
 
 
+def inverse_haar_2d(LL, HL, LH, HH):
+    """
+    Parameter-free Inverse Haar Transform.
+    Reconstructs the spatial resolution mathematically perfectly.
+    """
+    B, C, H2, W2 = LL.shape
+    
+    # Mathematical reversal of Haar DWT
+    TL = LL + HL + LH + HH
+    TR = LL - HL + LH - HH
+    BL = LL + HL - LH - HH
+    BR = LL - HL - LH + HH
+    
+    # Interleave pixels back to original resolution (B, C, H, W)
+    out = torch.empty(B, C, H2 * 2, W2 * 2, device=LL.device, dtype=LL.dtype)
+    out[:, :, 0::2, 0::2] = TL
+    out[:, :, 0::2, 1::2] = TR
+    out[:, :, 1::2, 0::2] = BL
+    out[:, :, 1::2, 1::2] = BR
+    
+    # Multiply by 0.5 to reverse the forward scaling factor
+    return out * 0.5
+
+
 class HaarEdgeIllumination(nn.Module):
     def __init__(self, in_channels: int = 4, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.dwt = HaarDWT2D(in_channels=in_channels)
         
-        # --- تغییر جدید: لایه فیلتر لبه (بسیار سبک) ---
-        # این لایه کمک می‌کند شبکه فرق بین "نویز کم‌نور" و "لبه واقعی" را درک کند
-        self.edge_filter = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, padding=1, 
-            groups=in_channels, bias=True
-        )
-        # ---------------------------------------------
-        
-        # 1. Learnable IDWT instead of Bilinear
-        self.idwt_conv = nn.ConvTranspose2d(
-            in_channels, in_channels, kernel_size=2, stride=2, 
-            groups=in_channels, bias=False
-        )
-        nn.init.constant_(self.idwt_conv.weight, 0.5)
-        
-        # 2. DWConv for spatial smoothing
-        self.dw_conv = nn.Conv2d(
-            in_channels, in_channels, 3, 1, 1, 
-            groups=in_channels, bias=False
-        )
+        # DWConv for spatial smoothing of the final map
+        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
         nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
         
-        # 3. Final Fusion (Dynamic channel weighting)
+        # Final Fusion
         self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
         nn.init.constant_(self.fuse_conv.weight, 0.0)
         nn.init.constant_(self.fuse_conv.bias, 0.0)
 
     def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # L_stack shape: (B, 4, H, W)
+        # 1. Forward Transform
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        raw_edge_energy = HL.abs() + LH.abs() + HH.abs()
+        # 2. Extract Edge Energy
+        edge_energy = torch.sigmoid(HL.abs() + LH.abs() + HH.abs())
 
-        refined_edge = torch.sigmoid(self.edge_filter(raw_edge_energy))
+        # 3. Modulate the LL band in the frequency domain
+        LL_modulated = LL * (1.0 + edge_energy)
+        
+        # 4. Deterministic Mathematical Reconstruction (NO Upsampling Parameters)
+        # We pass ALL bands to reconstruct perfectly, but LL is now modulated (enhanced).
+        L_reconstructed = inverse_haar_2d(LL_modulated, HL, LH, HH)
 
-        # Modulate the LL band BEFORE inverse transform
-        LL_modulated = LL * (1.0 + refined_edge)
-
-        # Apply Learnable Inverse Haar Transform
-        L_up = self.idwt_conv(LL_modulated)
-
-        # Final Smoothing and Fusion
-        L_smoothed = self.dw_conv(L_up)
+        # 5. Final Smoothing and Fusion
+        L_smoothed = self.dw_conv(L_reconstructed)
         delta_L = self.fuse_conv(L_smoothed)
         
         return delta_L
-
 
 
 
