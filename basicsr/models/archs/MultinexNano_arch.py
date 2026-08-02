@@ -450,14 +450,15 @@ class HaarIDWT2D(nn.Module):
         out = F.conv_transpose2d(x, self.kernel, stride=2, groups=self.groups)
         return out
 
-
 class HaarEdgeIllumination(nn.Module):
     """
     ماژول اصلی کشف و مدولاسیون لبه در حوزه موجک
     بودجه محاسباتی: تنها ۴۱ پارامتر!
     """
-    def __init__(self, in_channels: int = 4):
+    def __init__(self, in_channels: int = 4, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps # فقط برای سازگاری با کدهای فراخوان (API compatibility)
+        
         # تبدیل مستقیم و معکوس (0 پارامتر)
         self.dwt = HaarDWT2D(in_channels=in_channels)
         self.idwt = HaarIDWT2D(in_channels=in_channels)
@@ -489,7 +490,6 @@ class HaarEdgeIllumination(nn.Module):
         delta_L = self.fuse_conv(L_smoothed)
         
         return delta_L
-
 
 class MultinexNano(nn.Module):
     """
