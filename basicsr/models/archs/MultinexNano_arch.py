@@ -383,6 +383,27 @@ class ChrominanceExtractor(nn.Module):
 
 
 
+
+
+
+#  CHANGEABLE AREA - START 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 Haar-guided reliability-adaptive Multinex-Nano.
 
@@ -397,7 +418,6 @@ The existing flag has exactly one meaning:
 
 No additional MultinexNano initialization option is introduced.
 """
-
 
 
 class HaarDWT2D(nn.Module):
@@ -967,3 +987,17 @@ class MultinexNano(nn.Module):
 
     def param_count(self) -> int:
         return count_params(self)
+
+
+
+
+
+
+
+
+
+
+
+
+
+#  CHANGEABLE AREA - END 
