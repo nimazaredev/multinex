@@ -385,6 +385,7 @@ class ChrominanceExtractor(nn.Module):
 
 
 
+
 class HaarDWT2D(nn.Module):
     """Fixed one-level orthonormal 2D Haar transform."""
 
@@ -393,42 +394,42 @@ class HaarDWT2D(nn.Module):
         if in_channels < 1:
             raise ValueError("in_channels must be positive")
 
-        self.in_channels = in_channels
+        self.in_channels = int(in_channels)
 
-        # 2D outer products of [1, 1] / sqrt(2) and [1, -1] / sqrt(2).
-        # With this normalization, a constant 2x2 block with value c has LL=2c.
+        # 2D Haar filters. For a constant 2x2 block with value c, LL = 2c.
         kernels = torch.tensor(
             [
-                [[[0.5, 0.5], [0.5, 0.5]]],       # LL
-                [[[0.5, -0.5], [0.5, -0.5]]],     # HL
-                [[[0.5, 0.5], [-0.5, -0.5]]],     # LH
-                [[[0.5, -0.5], [-0.5, 0.5]]],     # HH
+                [[[0.5, 0.5], [0.5, 0.5]]],      # LL
+                [[[0.5, -0.5], [0.5, -0.5]]],    # HL
+                [[[0.5, 0.5], [-0.5, -0.5]]],    # LH
+                [[[0.5, -0.5], [-0.5, 0.5]]],    # HH
             ],
             dtype=torch.float32,
         )
-        kernels = kernels.repeat(in_channels, 1, 1, 1)
+        kernels = kernels.repeat(self.in_channels, 1, 1, 1)
         self.register_buffer("kernel", kernels, persistent=True)
 
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.ndim != 4:
-            raise ValueError(f"Expected BCHW input, got shape {tuple(x.shape)}")
+            raise ValueError(f"Expected BCHW input, got {tuple(x.shape)}")
         if x.shape[1] != self.in_channels:
             raise ValueError(
                 f"Expected {self.in_channels} channels, got {x.shape[1]}"
             )
 
         batch, channels, height, width = x.shape
-        pad_h, pad_w = height % 2, width % 2
+        pad_h = height % 2
+        pad_w = width % 2
         if pad_h or pad_w:
-            # Reflection is preferred, but it is invalid when a padded dimension is 1.
             pad_mode = "reflect" if height > 1 and width > 1 else "replicate"
             x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
 
+        kernel = self.kernel.to(device=x.device, dtype=x.dtype)
         coeffs = F.conv2d(
             x,
-            self.kernel,
+            kernel,
             stride=2,
             groups=self.in_channels,
         )
@@ -449,41 +450,34 @@ class HaarDWT2D(nn.Module):
 
 class HaarReliabilityEstimator(nn.Module):
     """
-    Estimate a full-resolution reliability map from RGB input.
+    Fixed Haar-based reliability estimator with no trainable parameters.
 
-    Haar is used only for reliability estimation:
-        1. LL/2 estimates local signal strength.
-        2. HH supplies a robust per-image noise scale through MAD.
-        3. Detail coefficients are clipped to the estimated noise range.
-        4. C = mu / (mu + nu + tau).
+    The constants follow the proposal:
+        noise threshold lambda = 2.5
+        uncertainty floor tau = 1e-3
 
-    The module has no learned parameters. The reliability floor tau is fixed.
+    Haar is used only to estimate reliability. It does not replace or
+    reconstruct the Multinex illumination branch.
     """
 
-    def __init__(
-        self,
-        noise_threshold: float = 2.5,
-        tau: float = 1e-3,
-        eps: float = 1e-6,
-    ) -> None:
+    def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
-        if noise_threshold <= 0:
-            raise ValueError("noise_threshold must be positive")
-        if tau <= 0:
-            raise ValueError("tau must be positive")
         if eps <= 0:
             raise ValueError("eps must be positive")
 
-        self.noise_threshold = float(noise_threshold)
         self.eps = float(eps)
         self.dwt = HaarDWT2D(in_channels=1)
 
         self.register_buffer(
-            "fixed_tau",
-            torch.tensor(tau, dtype=torch.float32),
+            "noise_threshold",
+            torch.tensor(2.5, dtype=torch.float32),
             persistent=True,
         )
-
+        self.register_buffer(
+            "tau",
+            torch.tensor(1e-3, dtype=torch.float32),
+            persistent=True,
+        )
         self.register_buffer(
             "rgb_to_luma",
             torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(
@@ -491,9 +485,6 @@ class HaarReliabilityEstimator(nn.Module):
             ),
             persistent=True,
         )
-
-    def _tau(self, reference: torch.Tensor) -> torch.Tensor:
-        return self.fixed_tau.to(device=reference.device, dtype=reference.dtype)
 
     @staticmethod
     def _spatial_median(x: torch.Tensor) -> torch.Tensor:
@@ -503,7 +494,7 @@ class HaarReliabilityEstimator(nn.Module):
 
     @staticmethod
     def _symmetric_clip(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
-        """Elementwise clip to [-bound, bound], where bound may vary by image."""
+        """Clip x elementwise to [-bound, bound]."""
         return torch.maximum(torch.minimum(x, bound), -bound)
 
     def forward(
@@ -517,18 +508,23 @@ class HaarReliabilityEstimator(nn.Module):
             )
 
         height, width = rgb.shape[-2:]
-        luma_weights = self.rgb_to_luma.to(device=rgb.device, dtype=rgb.dtype)
-        y = (rgb * luma_weights).sum(dim=1, keepdim=True)
+        output_dtype = rgb.dtype
+
+        # Compute robust statistics in float32 under mixed-precision training.
+        rgb_stats = rgb.float()
+        luma_weights = self.rgb_to_luma.to(device=rgb.device, dtype=torch.float32)
+        y = (rgb_stats * luma_weights).sum(dim=1, keepdim=True)
 
         ll, hl, lh, hh = self.dwt(y)
         mu = (ll / 2.0).clamp_min(0.0)
 
-        # Robust, per-image MAD estimate from HH. Stop-gradient follows the proposal.
+        # Robust per-image MAD estimate from HH; detached by design.
         hh_center = self._spatial_median(hh)
         mad = self._spatial_median((hh - hh_center).abs())
         sigma = (mad / 0.6745).detach()
 
-        bound = self.noise_threshold * sigma
+        threshold = self.noise_threshold.to(device=rgb.device, dtype=mu.dtype)
+        bound = threshold * sigma
         n_hl = self._symmetric_clip(hl, bound)
         n_lh = self._symmetric_clip(lh, bound)
         n_hh = self._symmetric_clip(hh, bound)
@@ -537,41 +533,40 @@ class HaarReliabilityEstimator(nn.Module):
             (n_hl.square() + n_lh.square() + n_hh.square()) / 3.0
             + self.eps
         )
-        tau = self._tau(mu)
+        tau = self.tau.to(device=rgb.device, dtype=mu.dtype)
         confidence_half = mu / (mu + nu + tau)
         confidence = F.interpolate(
             confidence_half,
             size=(height, width),
             mode="bilinear",
             align_corners=False,
-        ).clamp_(0.0, 1.0)
+        ).clamp(0.0, 1.0)
+        confidence = confidence.to(dtype=output_dtype)
 
         if not return_statistics:
             return confidence
 
         stats = {
-            "luminance": y,
-            "signal_half": mu,
-            "uncertainty_half": nu,
-            "noise_sigma": sigma,
-            "confidence_half": confidence_half,
-            "tau": tau.reshape(1),
+            "luminance": y.to(dtype=output_dtype),
+            "signal_half": mu.to(dtype=output_dtype),
+            "uncertainty_half": nu.to(dtype=output_dtype),
+            "noise_sigma": sigma.to(dtype=output_dtype),
+            "confidence_half": confidence_half.to(dtype=output_dtype),
+            "tau": tau.reshape(1).to(dtype=output_dtype),
         }
         return confidence, stats
 
 
 class MultinexNano(nn.Module):
     """
-    Multinex-Nano with Haar-guided reliability-adaptive chromatic correction.
+    Multinex-Nano with optional Haar-guided reliability-adaptive
+    chromatic correction.
 
-    Both original Multinex branches are preserved:
-        L_hat = luminance correction, shape Bx1xHxW
-        C_hat = RGB reflectance correction, shape Bx3xHxW
+    The existing flag controls the behavior directly:
+        use_haar_edge_illum=False: original baseline fusion
+        use_haar_edge_illum=True:  proposed Haar reliability method
 
-    The final reflectance correction is
-        C_ach + reliability * C_chr,
-    where C_ach is the RGB channel mean and C_chr is the zero-mean
-    color-changing component.
+    No new initialization flag or Haar hyperparameter is exposed.
     """
 
     def __init__(
@@ -596,38 +591,34 @@ class MultinexNano(nn.Module):
         chroma_head_act: Optional[str] = "tanh",
         retinex_residual: bool = True,
         eps: float = 1e-6,
-        # Existing project flag. When True, it enables the new Haar-guided
-        # reliability-adaptive chromatic correction. No new boolean flag is used.
         use_haar_edge_illum: bool = False,
-        haar_noise_threshold: float = 2.5,
-        haar_tau: float = 1e-3,
     ) -> None:
         super().__init__()
         if in_ch != 3 or out_ch != 3:
             raise ValueError(
-                "Reliability-adaptive chromatic correction is defined for RGB "
+                "Reliability-adaptive chromatic correction requires RGB "
                 "input/output; set in_ch=out_ch=3."
             )
         if illum_mid < 0 or chroma_mid < 0:
             raise ValueError("illum_mid and chroma_mid must be non-negative")
 
-        self.use_depthwise = use_depthwise
-        self.per_illum_proj = per_illum_proj
-        self.per_chroma_proj = per_chroma_proj
-        self.reduction_ratio = reduction_ratio
-        self.base_channels = base_channels
-        self.width_mult = width_mult
+        self.use_depthwise = bool(use_depthwise)
+        self.per_illum_proj = bool(per_illum_proj)
+        self.per_chroma_proj = bool(per_chroma_proj)
+        self.reduction_ratio = int(reduction_ratio)
+        self.base_channels = int(base_channels)
+        self.width_mult = float(width_mult)
         self.act = act
-        self.eps = eps
+        self.eps = float(eps)
         self.luma_head_act = luma_head_act
         self.chroma_head_act = chroma_head_act
-        self.retinex_residual = retinex_residual
-        self.use_illum_attn = use_illum_attn
-        self.use_chroma_attn = use_chroma_attn
+        self.retinex_residual = bool(retinex_residual)
+        self.use_illum_attn = bool(use_illum_attn)
+        self.use_chroma_attn = bool(use_chroma_attn)
         self.use_haar_edge_illum = bool(use_haar_edge_illum)
-        self.illum_mid = illum_mid
-        self.chroma_mid = chroma_mid
-        self.out_ch = out_ch
+        self.illum_mid = int(illum_mid)
+        self.chroma_mid = int(chroma_mid)
+        self.out_ch = int(out_ch)
 
         self.illum_extractor = IlluminationExtractor(illum_flags)
         self.chroma_extractor = ChrominanceExtractor(chroma_flags)
@@ -637,20 +628,19 @@ class MultinexNano(nn.Module):
             self.K_L = self.illum_extractor(dummy).shape[1]
             self.K_C = self.chroma_extractor(dummy).shape[1]
 
-        if self.use_haar_edge_illum:
-            self.haar_reliability = HaarReliabilityEstimator(
-                noise_threshold=haar_noise_threshold,
-                tau=haar_tau,
-                eps=eps,
-            )
-        else:
-            self.haar_reliability = None
+        # This module exists only when the existing YAML flag is True.
+        # It has no trainable parameters, so it does not alter target_params.
+        self.haar_reliability = (
+            HaarReliabilityEstimator(eps=self.eps)
+            if self.use_haar_edge_illum
+            else None
+        )
 
         channels = max(3, int(round(self.base_channels * self.width_mult)))
         self._build_width_dependent_modules(channels)
 
         if target_params is not None:
-            self._fit_param_budget(target_params)
+            self._fit_param_budget(int(target_params))
 
     def _make_block(self, c_in: int, c_out: int) -> nn.Module:
         if self.use_depthwise:
@@ -673,11 +663,11 @@ class MultinexNano(nn.Module):
         )
 
     def _build_width_dependent_modules(self, channels: int) -> None:
-        """Build all modules whose shape depends on the hidden width."""
-        self.C = channels
+        """Build every module whose dimensions depend on hidden width."""
+        self.C = int(channels)
 
-        self.illum_stem = nn.Conv2d(max(1, self.K_L), channels, 1, bias=True)
-        self.chroma_stem = nn.Conv2d(max(1, self.K_C), channels, 1, bias=True)
+        self.illum_stem = nn.Conv2d(max(1, self.K_L), self.C, 1, bias=True)
+        self.chroma_stem = nn.Conv2d(max(1, self.K_C), self.C, 1, bias=True)
 
         self.illum_att = nn.Conv2d(
             max(1, self.K_L),
@@ -700,45 +690,57 @@ class MultinexNano(nn.Module):
 
         if self.per_illum_proj:
             self.illum_att_proj = nn.ModuleList(
-                [nn.Conv2d(1, channels, 1, bias=True) for _ in range(max(1, self.K_L))]
+                [
+                    nn.Conv2d(1, self.C, 1, bias=True)
+                    for _ in range(max(1, self.K_L))
+                ]
             )
         else:
             self.illum_att_proj = nn.Conv2d(
-                max(1, self.K_L), channels, 1, bias=True
+                max(1, self.K_L), self.C, 1, bias=True
             )
 
         if self.per_chroma_proj:
             self.chroma_att_proj = nn.ModuleList(
-                [nn.Conv2d(1, channels, 1, bias=True) for _ in range(max(1, self.K_C))]
+                [
+                    nn.Conv2d(1, self.C, 1, bias=True)
+                    for _ in range(max(1, self.K_C))
+                ]
             )
         else:
             self.chroma_att_proj = nn.Conv2d(
-                max(1, self.K_C), channels, 1, bias=True
+                max(1, self.K_C), self.C, 1, bias=True
             )
 
         self.illum_mid_seq = self._make_stack_blocks(
-            channels, channels, depth=self.illum_mid
+            self.C, self.C, depth=self.illum_mid
         )
         self.chroma_mid_seq = self._make_stack_blocks(
-            channels, channels, depth=self.chroma_mid
+            self.C, self.C, depth=self.chroma_mid
         )
-        self.head_luma = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+        self.head_luma = nn.Conv2d(self.C, 1, kernel_size=1, bias=True)
         self.head_chroma = nn.Conv2d(
-            channels, self.out_ch, kernel_size=1, bias=True
+            self.C, self.out_ch, kernel_size=1, bias=True
         )
 
     def _att_project_to_C(
-        self, att: torch.Tensor, proj: Union[nn.ModuleList, nn.Conv2d]
+        self,
+        att: torch.Tensor,
+        proj: Union[nn.ModuleList, nn.Conv2d],
     ) -> torch.Tensor:
         if isinstance(proj, nn.ModuleList):
             projected = proj[0](att[:, 0:1])
             for index in range(1, att.shape[1]):
-                projected = projected + proj[index](att[:, index : index + 1])
+                projected = projected + proj[index](
+                    att[:, index : index + 1]
+                )
             return projected
         return proj(att)
 
     @staticmethod
-    def _apply_head_act(x: torch.Tensor, kind: Optional[str]) -> torch.Tensor:
+    def _apply_head_act(
+        x: torch.Tensor, kind: Optional[str]
+    ) -> torch.Tensor:
         if kind is None:
             return x
         key = kind.lower() if isinstance(kind, str) else ""
@@ -753,22 +755,22 @@ class MultinexNano(nn.Module):
         raise ValueError(f"Unsupported head activation: {kind}")
 
     def _fit_param_budget(self, target_params: int) -> None:
-        """Choose the widest valid hidden width under the requested budget.
+        """
+        Select the largest integer hidden width that fits target_params.
 
-        The new proposal preserves both original Multinex branches. Therefore an old
-        target_params value, tuned for the obsolete Haar illumination replacement, may
-        be lower than the new architecture's true minimum. In that case, use the
-        minimum valid width instead of aborting training, and report the actual count.
+        The Haar reliability module has zero trainable parameters, so the
+        same target budget applies whether the contribution is enabled or not.
         """
         if target_params <= 0:
             raise ValueError("target_params must be positive")
 
-        max_channels = max(3, int(round(self.base_channels * self.width_mult)))
+        max_channels = max(
+            3,
+            int(round(self.base_channels * self.width_mult)),
+        )
         best_channels = None
         best_params = None
 
-        # Search integer channel widths directly. This avoids binary-search errors caused
-        # by rounding width_mult to an integer channel count.
         for channels in range(3, max_channels + 1):
             self._build_width_dependent_modules(channels)
             params = count_params(self)
@@ -781,11 +783,10 @@ class MultinexNano(nn.Module):
             self._build_width_dependent_modules(best_channels)
             best_params = count_params(self)
             warnings.warn(
-                "target_params={} is below the minimum achievable parameter count "
-                "({}) for the reliability-adaptive architecture. Using the minimum "
-                "hidden width C=3 so training can proceed. Increase target_params or "
-                "remove it from the YAML if an exact budget is required.".format(
-                    target_params, best_params
+                "target_params={} is below the minimum achievable parameter "
+                "count ({}). Using the minimum hidden width C=3.".format(
+                    target_params,
+                    best_params,
                 ),
                 RuntimeWarning,
             )
@@ -830,8 +831,15 @@ class MultinexNano(nn.Module):
 
     @staticmethod
     def _reliability_adaptive_chroma(
-        chroma: torch.Tensor, reliability: torch.Tensor
+        chroma: torch.Tensor,
+        reliability: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Split RGB correction into achromatic and chromatic components:
+            achromatic = channel mean
+            chromatic  = chroma - achromatic
+            adjusted   = achromatic + reliability * chromatic
+        """
         achromatic = chroma.mean(dim=1, keepdim=True)
         chromatic = chroma - achromatic
         adjusted = achromatic + reliability * chromatic
@@ -848,6 +856,7 @@ class MultinexNano(nn.Module):
         rgb_in = x
         l_stack, c_stack = self._extract_stacks(x)
 
+        # Original Multinex illumination branch is always preserved.
         f_l = self._forward_branch(
             l_stack,
             self.illum_stem,
@@ -856,8 +865,12 @@ class MultinexNano(nn.Module):
             self.illum_mid_seq,
             self.use_illum_attn,
         )
-        l_hat = self._apply_head_act(self.head_luma(f_l), self.luma_head_act)
+        l_hat = self._apply_head_act(
+            self.head_luma(f_l),
+            self.luma_head_act,
+        )
 
+        # Original Multinex reflectance/chromatic branch.
         f_c = self._forward_branch(
             c_stack,
             self.chroma_stem,
@@ -867,23 +880,38 @@ class MultinexNano(nn.Module):
             self.use_chroma_attn,
         )
         c_hat = self._apply_head_act(
-            self.head_chroma(f_c), self.chroma_head_act
+            self.head_chroma(f_c),
+            self.chroma_head_act,
         )
 
+        # The existing flag directly activates the proposed contribution.
         if self.use_haar_edge_illum:
+            if self.haar_reliability is None:
+                raise RuntimeError(
+                    "use_haar_edge_illum=True but Haar reliability was not initialized"
+                )
+
             if return_aux:
                 reliability, reliability_stats = self.haar_reliability(
-                    x, return_statistics=True
+                    x,
+                    return_statistics=True,
                 )
             else:
                 reliability = self.haar_reliability(x)
                 reliability_stats = None
 
             c_adjusted, c_ach, c_chr = self._reliability_adaptive_chroma(
-                c_hat, reliability
+                c_hat,
+                reliability,
             )
         else:
-            reliability = x.new_ones(x.shape[0], 1, x.shape[2], x.shape[3])
+            # Exact original baseline behavior.
+            reliability = x.new_ones(
+                x.shape[0],
+                1,
+                x.shape[2],
+                x.shape[3],
+            )
             reliability_stats = None
             c_adjusted = c_hat
             c_ach = c_hat.mean(dim=1, keepdim=True)
@@ -896,6 +924,11 @@ class MultinexNano(nn.Module):
             return output
 
         aux = {
+            "haar_method_enabled": torch.tensor(
+                float(self.use_haar_edge_illum),
+                device=x.device,
+                dtype=x.dtype,
+            ),
             "reliability": reliability,
             "luma_correction": l_hat,
             "chroma_raw": c_hat,
@@ -905,7 +938,12 @@ class MultinexNano(nn.Module):
             "image_correction": correction,
         }
         if reliability_stats is not None:
-            aux.update({f"haar_{key}": value for key, value in reliability_stats.items()})
+            aux.update(
+                {
+                    f"haar_{key}": value
+                    for key, value in reliability_stats.items()
+                }
+            )
         return output, aux
 
     def param_count(self) -> int:
