@@ -380,10 +380,18 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class HaarDWT2D(nn.Module):
     def __init__(self, in_channels: int = 1):
         super().__init__()
         self.groups = in_channels
+        # تبدیل هار کاملاً ثابت و بدون پارامتر یادگیرنده باقی ماند
         k = torch.tensor([
             [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
             [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
@@ -411,16 +419,26 @@ class HaarEdgeIllumination(nn.Module):
         self.eps = eps
         self.dwt = HaarDWT2D(in_channels=in_channels)
         
-        # 1. Learnable IDWT instead of Bilinear (Only 16 parameters!)
+        # --- تغییر جدید: لایه فیلتر لبه (بسیار سبک) ---
+        # این لایه کمک می‌کند شبکه فرق بین "نویز کم‌نور" و "لبه واقعی" را درک کند
+        self.edge_filter = nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, padding=1, 
+            groups=in_channels, bias=True
+        )
+        # ---------------------------------------------
+        
+        # 1. Learnable IDWT instead of Bilinear
         self.idwt_conv = nn.ConvTranspose2d(
             in_channels, in_channels, kernel_size=2, stride=2, 
             groups=in_channels, bias=False
         )
-        # Initialize with standard IDWT scale
         nn.init.constant_(self.idwt_conv.weight, 0.5)
         
         # 2. DWConv for spatial smoothing
-        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
+        self.dw_conv = nn.Conv2d(
+            in_channels, in_channels, 3, 1, 1, 
+            groups=in_channels, bias=False
+        )
         nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
         
         # 3. Final Fusion (Dynamic channel weighting)
@@ -432,13 +450,14 @@ class HaarEdgeIllumination(nn.Module):
         # L_stack shape: (B, 4, H, W)
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        # Calculate Edge Energy in Frequency Domain (H/2, W/2)
-        edge_energy = torch.sigmoid(HL.abs() + LH.abs() + HH.abs())
+        raw_edge_energy = HL.abs() + LH.abs() + HH.abs()
+
+        refined_edge = torch.sigmoid(self.edge_filter(raw_edge_energy))
 
         # Modulate the LL band BEFORE inverse transform
-        LL_modulated = LL * (1.0 + edge_energy)
+        LL_modulated = LL * (1.0 + refined_edge)
 
-        # Apply Learnable Inverse Haar Transform (Perfect Spatial Reconstruction)
+        # Apply Learnable Inverse Haar Transform
         L_up = self.idwt_conv(LL_modulated)
 
         # Final Smoothing and Fusion
@@ -446,6 +465,10 @@ class HaarEdgeIllumination(nn.Module):
         delta_L = self.fuse_conv(L_smoothed)
         
         return delta_L
+
+
+
+
 
 class MultinexNano(nn.Module):
     """
