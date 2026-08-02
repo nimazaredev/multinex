@@ -10,7 +10,7 @@ import math
 import warnings
 from torch.nn.init import _calculate_fan_in_and_fan_out
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import os
 from pathlib import Path
