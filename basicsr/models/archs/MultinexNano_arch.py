@@ -381,9 +381,6 @@ class ChrominanceExtractor(nn.Module):
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
 
-
-
-
 class HaarDWT2D(nn.Module):
     def __init__(self, in_channels: int = 1):
         super().__init__()
@@ -408,29 +405,98 @@ class HaarDWT2D(nn.Module):
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
         return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
 
-
 def inverse_haar_2d(LL, HL, LH, HH):
     """
-    Parameter-free Inverse Haar Transform.
-    Reconstructs the spatial resolution mathematically perfectly.
+    بازسازی کاملاً ریاضی و بدون پارامتر
     """
     B, C, H2, W2 = LL.shape
     
-    # Mathematical reversal of Haar DWT
     TL = LL + HL + LH + HH
     TR = LL - HL + LH - HH
     BL = LL + HL - LH - HH
     BR = LL - HL - LH + HH
     
-    # Interleave pixels back to original resolution (B, C, H, W)
     out = torch.empty(B, C, H2 * 2, W2 * 2, device=LL.device, dtype=LL.dtype)
     out[:, :, 0::2, 0::2] = TL
     out[:, :, 0::2, 1::2] = TR
     out[:, :, 1::2, 0::2] = BL
     out[:, :, 1::2, 1::2] = BR
     
-    # Multiply by 0.5 to reverse the forward scaling factor
     return out * 0.5
+
+class SoftThreshold(nn.Module):
+    """
+    آستانه‌گذاری نرم یادگیرنده برای حذف نویزهای فرکانس بالا (پواسون)
+    """
+    def __init__(self, channels: int, init_val: float = 0.01):
+        super().__init__()
+        # یک پارامتر بسیار سبک (tau) برای هر کانال
+        self.tau = nn.Parameter(torch.full((1, channels, 1, 1), init_val))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # فرمول: sgn(x) * max(|x| - tau, 0)
+        return torch.sign(x) * F.relu(x.abs() - self.tau)
+
+class HaarEdgeIlluminationV2(nn.Module):
+    def __init__(self, in_channels: int = 1):
+        super().__init__()
+        self.dwt = HaarDWT2D(in_channels=in_channels)
+        
+        # ماژول‌های حذف نویز برای دو سطح فرکانسی
+        self.soft_thresh_l1 = SoftThreshold(in_channels)
+        self.soft_thresh_l2 = SoftThreshold(in_channels)
+        
+        # فیلتر هموارساز مکان‌محور (فقط ۹ پارامتر برای هر کانال)
+        self.smooth_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
+        nn.init.constant_(self.smooth_conv.weight, 1.0 / 9.0)
+        
+        # لایه ترکیب نهایی
+        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
+        nn.init.constant_(self.fuse_conv.weight, 0.0)
+        nn.init.constant_(self.fuse_conv.bias, 0.0)
+
+    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
+        # --- ۱. تجزیه آبشاری (Cascade Decomposition) ---
+        # سطح ۱ (رزولوشن ۱/۲)
+        LL1, HL1, LH1, HH1 = self.dwt(L_stack)
+        
+        # سطح ۲ (رزولوشن ۱/۴) - افزایش شدید میدان دید (Receptive Field) بدون پارامتر
+        LL2, HL2, LH2, HH2 = self.dwt(LL1)
+
+        # --- ۲. حذف نویز (Denoising) از باندهای بالاگذر ---
+        HL2_t = self.soft_thresh_l2(HL2)
+        LH2_t = self.soft_thresh_l2(LH2)
+        HH2_t = self.soft_thresh_l2(HH2)
+        
+        HL1_t = self.soft_thresh_l1(HL1)
+        LH1_t = self.soft_thresh_l1(LH1)
+        HH1_t = self.soft_thresh_l1(HH1)
+
+        # --- ۳. بازسازی تصویر (Reconstruction) ---
+        # بازسازی لایه اول از روی لایه دوم (با لبه‌های فیلتر شده)
+        L1_recon = inverse_haar_2d(LL2, HL2_t, LH2_t, HH2_t)
+        
+        # بازسازی نهایی به رزولوشن اصلی
+        L0_recon = inverse_haar_2d(L1_recon, HL1_t, LH1_t, HH1_t)
+
+        # --- ۴. تولید نقشه لبه و هموارسازی آگاه به لبه (Edge-Aware Gating) ---
+        # ساخت نقشه لبه در رزولوشن اصلی به صورت کاملاً ریاضی با قرار دادن LL=0
+        edge_map_hr = inverse_haar_2d(torch.zeros_like(LL1), HL1_t.abs(), LH1_t.abs(), HH1_t.abs())
+        edge_gate = torch.sigmoid(edge_map_hr) # مقادیر بین 0 (سطح صاف) و 1 (لبه تیز)
+        
+        # اعمال هموارساز روی تصویر بازسازی شده
+        L0_smoothed = self.smooth_conv(L0_recon)
+        
+        # ترفند اصلی ترکیب: 
+        # در لبه‌ها (edge_gate نزدیک به 1)، مقدار پیکسل دست‌نخورده باقی می‌ماند تا مرزها حفظ شوند.
+        # در نواحی صاف (edge_gate نزدیک به 0)، از خروجی هموارساز استفاده می‌شود.
+        L_final = (edge_gate * L0_recon) + ((1.0 - edge_gate) * L0_smoothed)
+
+        # --- ۵. خروجی نهایی ---
+        delta_L = self.fuse_conv(L_final)
+        
+        return delta_L
+
 
 
 class HaarEdgeIllumination(nn.Module):
