@@ -381,90 +381,86 @@ class ChrominanceExtractor(nn.Module):
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
 
-
-
 class HaarDWT2D(nn.Module):
-    """Parameter-free 2D Haar DWT on a single-channel input.
-
-    Input:  (B,1,H,W)
-    Output: LL, HL, LH, HH each (B,1,H/2,W/2)
+    """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups.
     """
-    def __init__(self):
+    def __init__(self, in_channels: int = 1):
         super().__init__()
-        # 2x2 blocks: a=top-left, b=top-right, c=bottom-left, d=bottom-right
+        self.groups = in_channels
+        # 2x2 blocks for Haar Transform
         k = torch.tensor([
             [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
             [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
             [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
             [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
-        ], dtype=torch.float32)  # (4,1,2,2)
+        ], dtype=torch.float32)  # (4, 1, 2, 2)
+        
+        # Repeat kernel for multiple channels (e.g., 4 channels -> 16 filters)
+        k = k.repeat(in_channels, 1, 1, 1)
         self.register_buffer("kernel", k)
 
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.shape
-        assert C == 1, "HaarDWT2D expects a single-channel input"
         pad_h, pad_w = H % 2, W % 2
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
-        out = F.conv2d(x, self.kernel, stride=2)  # (B,4,H/2,W/2)
-        LL, HL, LH, HH = out[:, 0:1], out[:, 1:2], out[:, 2:3], out[:, 3:4]
+            
+        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups) # (B, 4*C, H/2, W/2)
+        
+        # Reshape to (B, C, 4, H/2, W/2) for easy slicing
+        out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
+        LL = out[:, :, 0]
+        HL = out[:, :, 1]
+        LH = out[:, :, 2]
+        HH = out[:, :, 3]
         return LL, HL, LH, HH
+
 
 class HaarEdgeIllumination(nn.Module):
     """
-    Wavelet-based illumination dictation.
-    Extracts LL (base) and High-Frequency (edges) from Y_vmax.
-    Modulates the base with edge energy, upsamples, and smoothes with a single DWConv.
-    
-    Total parameters: Exactly 9 (1 DWConv 3x3, no bias).
+    Hybrid Wavelet-Multinex Illumination:
+    Applies Haar DWT over the full Multinex L_stack (e.g., 4 channels).
+    Total Params for 4 channels: (3x3x4) + (1x1x4) = 36 + 4 = 40 parameters.
     """
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, in_channels: int = 4, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.dwt = HaarDWT2D()
+        self.dwt = HaarDWT2D(in_channels=in_channels)
         
-        # تنها یک لایه Depthwise Conv بدون بایاس برای حفظ بودجه ۹ پارامتری
-        self.dw_conv = nn.Conv2d(
-            in_channels=1, 
-            out_channels=1, 
-            kernel_size=3, 
-            stride=1, 
-            padding=1, 
-            groups=1, 
-            bias=False
-        )
+        # DWConv for spatial smoothing per channel (3x3, groups=in_channels, no bias)
+        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
+        # Smart Initialization: acts as an average pool initially
+        nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
+        
+        # 1x1 Conv to fuse the 4 priors into 1 illumination map
+        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=False)
+        # Smart Initialization: simple channel averaging initially
+        nn.init.constant_(self.fuse_conv.weight, 1.0 / in_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        assert C == 3, "HaarEdgeIllumination expects RGB input (B,3,H,W)"
+    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
+        # L_stack is now (B, 4, H, W) directly from illum_extractor
+        B, C, H, W = L_stack.shape
 
-        # 1. استخراج کانال ماکزیمم
-        R, G, Bc = x[:, 0:1], x[:, 1:2], x[:, 2:3]
-        y_vmax = torch.maximum(R, torch.maximum(G, Bc))
+        LL, HL, LH, HH = self.dwt(L_stack)
 
-        # 2. تجزیه موجک هار (بدون پارامتر)
-        LL, HL, LH, HH = self.dwt(y_vmax)
-
-        # 3. محاسبه انرژی لبه‌ها از باندهای بالاگذر
+        # Edge Energy (B, 4, H/2, W/2)
         edge_energy = HL.abs() + LH.abs() + HH.abs()
 
-        # 4. آپ‌سمپلینگ Bilinear به رزولوشن اصلی (طبق پروپوزال)
+        # Upsample back to original resolution
         LL_up = F.interpolate(LL, size=(H, W), mode='bilinear', align_corners=False)
         edge_up = F.interpolate(edge_energy, size=(H, W), mode='bilinear', align_corners=False)
 
-        # 5. دیکته کردن لبه‌ها به نقشه روشنایی (Modulation)
+        # Modulate Base with Edges
         m_edge = torch.sigmoid(edge_up)
         f_modulated = LL_up * (1.0 + m_edge)
 
-        # 6. اعمال کانولوشن ۹ پارامتری برای نرم‌کردن نهایی
-        delta_L_raw = self.dw_conv(f_modulated)
-
-        # 7. اعمال تابع فعال‌ساز نهایی (بسیار مهم برای جلوگیری از انفجار L_hat)
-        delta_L = torch.sigmoid(delta_L_raw)
+        # Smooth and Fuse
+        delta_L_raw = self.dw_conv(f_modulated)       # (B, 4, H, W)
+        delta_L_fused = self.fuse_conv(delta_L_raw)   # (B, 1, H, W)
         
+        # Bounding final illumination
+        delta_L = torch.sigmoid(delta_L_fused)
         return delta_L
-
-
 
 
 
@@ -544,13 +540,8 @@ class MultinexNano(nn.Module):
         self.chroma_stem = nn.Conv2d(max(1, K_C), C, kernel_size=1, bias=True)
 
         if self.use_haar_edge_illum:
-            # ---- lightweight wavelet illumination branch (replaces illum_* trunk)
-            self.haar_illum = HaarEdgeIllumination(eps=eps)
-            # keep illum_stem/att/proj as unused None to avoid attribute errors elsewhere
-            self.illum_stem = None
-            self.illum_att = None
-            self.illum_att_proj = None
-            self.illum_mid_seq = None
+            # Pass the calculated K_L (which is 4 by default in Multinex)
+            self.haar_illum = HaarEdgeIllumination(in_channels=self.K_L, eps=eps)
         else:
             self.illum_stem  = nn.Conv2d(max(1, K_L), C, kernel_size=1, bias=True)
 
@@ -675,7 +666,10 @@ class MultinexNano(nn.Module):
         fC = self.chroma_mid_seq(fC)
 
         if self.use_haar_edge_illum:
-            L_hat = self.haar_illum(rgb_in)                       # (B,1,H,W)
+            L_stack = self.illum_extractor(x)
+            if L_stack.shape[1] == 0:
+                L_stack = x.new_zeros(B, 1, H, W)
+            L_hat = self.haar_illum(L_stack) 
         else:
             L_stack = self.illum_extractor(x)
             if L_stack.shape[1] == 0:
