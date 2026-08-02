@@ -410,25 +410,22 @@ class HaarDWT2D(nn.Module):
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
         return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
 
-
 class HaarEdgeIllumination(nn.Module):
     """
-    ماژول اصلاح‌شده مدولاسیون فرکانسی روشنایی (معماری Multinex)
-    تعداد پارامتر کل: ۵۸ پارامتر
+    ماژول اصلاح‌شده مدولاسیون فرکانسی روشنایی (۵۸ پارامتر)
     """
-    def __init__(self, in_channels: int = 4):
+    def __init__(self, in_channels: int = 4, eps: float = 1e-6): # <--- افزودن eps برای سازگاری با API
         super().__init__()
+        self.eps = eps
         self.dwt = HaarDWT2D(in_channels=in_channels)
         
         # ضریب قابل یادگیری برای کنترل شدت مدولاسیون لبه‌ها (۱ پارامتر)
         self.edge_scale = nn.Parameter(torch.tensor([0.1]))
         
         # ۱. بازسازی یادگیرنده به جای IDWT ثابت (۱۶ پارامتر)
-        # به شبکه اجازه می‌دهد ناهمخوانی فرکانسی ناشی از مدولاسیون را جبران کند
         self.learnable_idwt = nn.ConvTranspose2d(
             in_channels * 4, in_channels, kernel_size=2, stride=2, groups=in_channels, bias=False
         )
-        # مقداردهی اولیه با وزن‌های دقیق معکوس هار
         with torch.no_grad():
             k_idwt = torch.tensor([
                 [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
@@ -444,7 +441,6 @@ class HaarEdgeIllumination(nn.Module):
         
         # ۳. ادغام نهایی کانال‌ها (۵ پارامتر)
         self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        # مقداردهی اولیه مناسب برای جلوگیری از گرادیان صفر
         nn.init.kaiming_uniform_(self.fuse_conv.weight, a=1)
         nn.init.constant_(self.fuse_conv.bias, 0.0)
 
@@ -452,11 +448,10 @@ class HaarEdgeIllumination(nn.Module):
         # ۱. انتقال به حوزه فرکانس
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        # ۲. محاسبه انرژی لبه با استفاده از Tanh (محدوده 0 تا 1)
-        # اگر لبه‌ای نباشد، مقدار zero خواهد بود
+        # ۲. محاسبه انرژی لبه با Tanh
         edge_energy = torch.tanh(HL.abs() + LH.abs() + HH.abs())
 
-        # ۳. مدولاسیون کنترل‌شده: در مناطق صاف (edge_energy=0) ضریب دقیقاً 1.0 می‌ماند
+        # ۳. مدولاسیون کنترل‌شده روشنایی پایه
         LL_modulated = LL * (1.0 + self.edge_scale * edge_energy)
 
         # ۴. بازسازی با ConvTranspose2d یادگیرنده
@@ -464,12 +459,11 @@ class HaarEdgeIllumination(nn.Module):
         x_freq = torch.stack([LL_modulated, HL, LH, HH], dim=2).view(B, C * 4, H, W)
         L_up = self.learnable_idwt(x_freq)
 
-        # ۵. هموارسازی ناهنجاری‌ها و ادغام کانال‌ها
+        # ۵. هموارسازی و همجوشی کانال‌ها
         L_smoothed = self.dw_conv(L_up)
         delta_L = self.fuse_conv(L_smoothed)
         
         return delta_L
-
 
 class MultinexNano(nn.Module):
     """
