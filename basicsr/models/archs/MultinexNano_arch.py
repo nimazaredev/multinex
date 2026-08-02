@@ -381,23 +381,14 @@ class ChrominanceExtractor(nn.Module):
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
 
+
+
+
+
+
+
 class HaarDWT2D(nn.Module):
-    """Fixed one-level 2-D orthonormal Haar analysis transform.
-
-    Input:
-        x: (B, C, H, W)
-
-    Output:
-        LL, HL, LH, HH, each with shape
-        (B, C, ceil(H / 2), ceil(W / 2)).
-
-    Naming convention used here:
-        HL: high-pass along image width (x direction)
-        LH: high-pass along image height (y direction)
-
-    Odd input sizes are padded on the bottom/right. The caller should crop the
-    inverse-transform output back to the original H and W.
-    """
+    """Fixed one-level 2-D orthonormal Haar analysis transform."""
 
     def __init__(self, in_channels: int = 4, padding_mode: str = "reflect"):
         super().__init__()
@@ -410,7 +401,6 @@ class HaarDWT2D(nn.Module):
         self.groups = int(in_channels)
         self.padding_mode = padding_mode
 
-        # 0.5 gives an orthonormal 2-D Haar transform for 2x2 blocks.
         kernels = torch.tensor(
             [
                 [[[0.5, 0.5], [0.5, 0.5]]],       # LL
@@ -430,7 +420,6 @@ class HaarDWT2D(nn.Module):
         if not (pad_h or pad_w):
             return x
 
-        # Reflection padding is undefined when a spatial dimension is 1.
         mode = self.padding_mode
         if mode == "reflect" and (h < 2 or w < 2):
             mode = "replicate"
@@ -513,12 +502,7 @@ class HaarIDWT2D(nn.Module):
 
 
 class PositiveDepthwiseSmoothing(nn.Module):
-    """Trainable depthwise smoothing with positive, sum-to-one kernels.
-
-    The unconstrained logits are trainable, while spatial softmax guarantees
-    that each channel kernel remains a convex averaging filter. For C=4 and a
-    3x3 kernel this layer has 36 trainable parameters.
-    """
+    """Trainable depthwise smoothing with positive, sum-to-one kernels."""
 
     def __init__(
         self,
@@ -539,7 +523,6 @@ class PositiveDepthwiseSmoothing(nn.Module):
         self.padding = kernel_size // 2
         self.padding_mode = padding_mode
 
-        # Equal logits -> uniform averaging kernel at initialization.
         self.logits = nn.Parameter(
             torch.zeros(self.channels, 1, kernel_size, kernel_size)
         )
@@ -572,24 +555,7 @@ class PositiveDepthwiseSmoothing(nn.Module):
 
 
 class HaarEdgeIllumination(nn.Module):
-    """Refined 44-parameter Haar illumination-correction module for C=4.
-
-    Pipeline:
-        1. Fixed Haar DWT.
-        2. Robust per-image/per-channel noise estimation from HH using MAD.
-        3. Adaptive soft thresholding of HL, LH and HH.
-        4. Edge confidence computed from the denoised detail coefficients.
-        5. Exact fixed Haar IDWT to obtain denoised guidance X_d.
-        6. Constrained depthwise smoothing to obtain X_s.
-        7. Edge-aware blend: Z = E * X_d + (1-E) * X_s.
-        8. 1x1 channel fusion and bounded correction Delta_L.
-
-    Trainable parameters for in_channels=4:
-        threshold multipliers: 3
-        positive 3x3 depthwise smoothing kernels: 4*9 = 36
-        1x1 fusion with bias: 4+1 = 5
-        total: 44
-    """
+    """Refined Haar illumination-correction module with spatial context restoration."""
 
     _MAD_NORMALIZER = 0.6744897501960817
 
@@ -628,7 +594,6 @@ class HaarEdgeIllumination(nn.Module):
         self.dwt = HaarDWT2D(in_channels, padding_mode=padding_mode)
         self.idwt = HaarIDWT2D(in_channels)
 
-        # Positive threshold multipliers lambda_k = softplus(a_k).
         raw_init = torch.log(torch.expm1(threshold_tensor.clamp_min(1e-4)))
         self.raw_threshold_scales = nn.Parameter(raw_init)
 
@@ -638,18 +603,22 @@ class HaarEdgeIllumination(nn.Module):
             padding_mode=padding_mode,
         )
 
-        self.fuse_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
-        # A small non-zero initialization keeps the residual model close to the
-        # identity while allowing gradients to reach the chroma branch.
-        nn.init.constant_(self.fuse_conv.weight, 1e-3 / in_channels)
-        nn.init.zeros_(self.fuse_conv.bias)
+        # اصلاح: استفاده از یک بلوک کانولوشن محلی $3\times3$ برای بازگرداندن درک فضایی
+        # بجای کانولوشن ساده $1\times1$ که باعث کوری شبکه می‌شد.
+        self.spatial_context_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
+        )
+        
+        nn.init.constant_(self.spatial_context_conv[-1].weight, 1e-3 / in_channels)
+        nn.init.zeros_(self.spatial_context_conv[-1].bias)
 
     @property
     def threshold_scales(self) -> torch.Tensor:
         return F.softplus(self.raw_threshold_scales) + self.eps
 
     def _estimate_noise_mad(self, hh: torch.Tensor) -> torch.Tensor:
-        """Return robust sigma with shape (B, C, 1, 1)."""
         flat = hh.flatten(start_dim=2)
         center = flat.median(dim=2, keepdim=True).values
         mad = (flat - center).abs().median(dim=2, keepdim=True).values
@@ -680,13 +649,9 @@ class HaarEdgeIllumination(nn.Module):
 
         original_size = l_stack.shape[-2:]
 
-        # 1) Fixed Haar analysis.
         ll, hl, lh, hh = self.dwt(l_stack)
-
-        # 2) Robust noise estimate from the finest detail band.
         sigma = self._estimate_noise_mad(hh)
 
-        # 3) Direction-specific adaptive soft thresholds.
         lambdas = self.threshold_scales
         tau_hl = lambdas[0].view(1, 1, 1, 1) * sigma
         tau_lh = lambdas[1].view(1, 1, 1, 1) * sigma
@@ -696,10 +661,7 @@ class HaarEdgeIllumination(nn.Module):
         lh_d = self._soft_threshold(lh, tau_lh)
         hh_d = self._soft_threshold(hh, tau_hh)
 
-        # 4) Signal-to-noise-normalized edge confidence after denoising.
         detail_power = hl_d.square() + lh_d.square() + hh_d.square()
-        # Subtract sqrt(eps) so an exactly flat region gives D=0, not a
-        # falsely high confidence when sigma is also near zero.
         detail_magnitude = (
             torch.sqrt(detail_power + self.eps) - self.eps ** 0.5
         ).clamp_min(0.0)
@@ -708,13 +670,9 @@ class HaarEdgeIllumination(nn.Module):
         )
         edge_half = edge_per_channel.mean(dim=1, keepdim=True)
 
-        # 5) Exact fixed reconstruction of the denoised guidance.
         x_d = self.idwt(ll, hl_d, lh_d, hh_d, output_size=original_size)
-
-        # 6) A guaranteed smoothing alternative.
         x_s = self.smoother(x_d)
 
-        # 7) Preserve denoised details near reliable edges; smooth flat regions.
         edge_full = F.interpolate(
             edge_half,
             size=original_size,
@@ -723,8 +681,8 @@ class HaarEdgeIllumination(nn.Module):
         ).clamp_(0.0, 1.0)
         z = edge_full * x_d + (1.0 - edge_full) * x_s
 
-        # 8) Fuse channels and bound the illumination correction.
-        q = self.fuse_conv(z)
+        # اعمال فیوژن فضایی جدید برای حفظ بافت و کنتراست نوری
+        q = self.spatial_context_conv(z)
         delta_l = self.delta_max * torch.tanh(q)
 
         if not return_aux:
@@ -745,263 +703,3 @@ class HaarEdgeIllumination(nn.Module):
 
     def trainable_parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-
-def verify_haar_reconstruction(
-    channels: int = 4,
-    height: int = 63,
-    width: int = 65,
-    device: Optional[torch.device] = None,
-) -> float:
-    """Return max absolute DWT->IDWT error, including odd-size crop logic."""
-    device = device or torch.device("cpu")
-    dwt = HaarDWT2D(channels).to(device)
-    idwt = HaarIDWT2D(channels).to(device)
-    x = torch.randn(2, channels, height, width, device=device)
-    bands = dwt(x)
-    x_hat = idwt(*bands, output_size=(height, width))
-    return float((x_hat - x).abs().max().item())
-
-
-class MultinexNano(nn.Module):
-    """
-    RetinexMSEFMultiLum with direct (non-gating) attention application and 3-stage block layout:
-      Branch = pre_blocks -> [optional attention] -> mid_blocks -> post_blocks
-      Illum:  maps -> stem(C) -> pre -> (attn?) -> mid -> post -> head(1)
-      Chroma: maps -> stem(C) -> pre -> (attn?) -> mid -> post -> head(3)
-      Fusion: out = chroma3 * delta_luma1 (+ optional residual)
-
-    When use_haar_edge_illum=True, the illumination branch is replaced by the
-    refined fixed-DWT / adaptive-threshold / edge-aware-smoothing pipeline.
-
-    All previous knobs preserved; new knobs add maximum flexibility.
-    """
-    def __init__(self,
-             in_ch: int = 3,
-             out_ch: int = 3,
-             base_channels: int = 32,
-             use_depthwise: bool = True,
-             per_illum_proj: bool = True,
-             reduction_ratio: int = 16,
-             width_mult: float = 1.0,
-             target_params: Optional[int] = None,
-             illum_flags: Optional[Dict[str, bool]] = None,
-             act=nn.SiLU,
-
-             chroma_flags: Optional[Dict[str, bool]] = None,
-             per_chroma_proj: bool = True,
-
-             use_illum_attn: bool = True,
-             use_chroma_attn: bool = True,
-
-             illum_mid: int = 1,
-             chroma_mid: int = 1,
-
-             # Heads & fusion
-             luma_head_act: Optional[str] = 'sigmoid',
-             chroma_head_act: Optional[str] = 'tanh',
-             retinex_residual: bool = True,
-             eps: float = 1e-6,
-
-             use_haar_edge_illum: bool = False,
-             haar_threshold_init: Sequence[float] = (1.0, 1.0, 1.0),
-             haar_edge_rho: float = 1.0,
-             haar_delta_max: float = 1.0,
-             haar_detach_noise_estimate: bool = True,
-             ):
-        super().__init__()
-        self.use_depthwise = use_depthwise
-        self.per_illum_proj = per_illum_proj
-        self.per_chroma_proj = per_chroma_proj
-        self.reduction_ratio = reduction_ratio
-        self.base_channels = base_channels
-        self.width_mult = width_mult
-        self.act = act
-        self.eps = eps
-        self.luma_head_act = luma_head_act
-        self.chroma_head_act = chroma_head_act
-        self.retinex_residual = retinex_residual
-
-        self.use_illum_attn = use_illum_attn
-        self.use_chroma_attn = use_chroma_attn
-        self.use_haar_edge_illum = use_haar_edge_illum
-
-        # ---- extractors
-        self.illum_extractor = IlluminationExtractor(illum_flags)
-        self.chroma_extractor = ChrominanceExtractor(chroma_flags)
-
-        # determine K_L and K_C
-        with torch.no_grad():
-            dummy = torch.zeros(1,3,8,8)
-            K_L = self.illum_extractor(dummy).shape[1]
-            K_C = self.chroma_extractor(dummy).shape[1]
-        self.K_L, self.K_C = K_L, K_C
-
-        # ---- channel base
-        C = max(3, int(round(self.base_channels * self.width_mult)))
-        self.C = C
-
-        # ---- stems
-        self.chroma_stem = nn.Conv2d(max(1, K_C), C, kernel_size=1, bias=True)
-
-        if self.use_haar_edge_illum:
-            # K_L is normally 4. max(1, K_L) also supports an empty extractor.
-            self.haar_illum = HaarEdgeIllumination(
-                in_channels=max(1, self.K_L),
-                eps=eps,
-                threshold_init=haar_threshold_init,
-                edge_rho=haar_edge_rho,
-                delta_max=haar_delta_max,
-                detach_noise_estimate=haar_detach_noise_estimate,
-            )
-        else:
-            self.illum_stem  = nn.Conv2d(max(1, K_L), C, kernel_size=1, bias=True)
-
-            # ---- attention modules per branch (produce (B,K, H, W))
-            self.illum_att = nn.Conv2d(max(1, K_L), max(1, K_L), kernel_size=7, stride=1, padding=3, groups=max(1, K_L), bias=True)
-
-            # ---- attention projection K->C per branch
-            if self.per_illum_proj:
-                self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,K_L))])
-            else:
-                self.illum_att_proj = nn.Conv2d(max(1,K_L), C, 1, 1, 0, bias=True)
-
-            self.illum_mid_seq = self._make_stack_blocks(C, C, depth=illum_mid)
-
-        self.chroma_att = nn.Conv2d(max(1, K_C), max(1, K_C), kernel_size=7, stride=1, padding=3, groups=max(1, K_C), bias=True)
-
-        if self.per_chroma_proj:
-            self.chroma_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,K_C))])
-        else:
-            self.chroma_att_proj = nn.Conv2d(max(1,K_C), C, 1, 1, 0, bias=True)
-
-        self.chroma_mid_seq = self._make_stack_blocks(C, C, depth=chroma_mid)
-
-        # ---- heads
-        if not self.use_haar_edge_illum:
-            self.head_luma = nn.Conv2d(C, 1, kernel_size=1, bias=True)
-        self.head_chroma = nn.Conv2d(C, out_ch, kernel_size=1, bias=True)
-
-        # ---- optional param budget auto-shrink
-        if target_params is not None:
-            self._fit_param_budget(target_params, in_ch, out_ch)
-
-    # ---- helpers (unchanged except we don’t build BN/act gates now)
-    def _make_block(self, c_in, c_out):
-        if self.use_depthwise:
-            return nn.Sequential(
-                DWSeparableConv(c_in, c_out, k=3, s=1, p=1, act=self.act),
-                MSEFBlock(c_out, self.reduction_ratio),
-            )
-        else:
-            return nn.Sequential(
-                ConvBNAct(c_in, c_out, k=3, s=1, p=1, act=self.act),
-                MSEFBlock(c_out, self.reduction_ratio),
-            )
-
-    def _make_stack_blocks(self, c_in, c_out, depth=1):
-        return nn.Sequential(*[self._make_block(c_in, c_out) for _ in range(depth)]) if depth > 0 else nn.Identity()
-
-    def _att_project_to_C(self, att, proj):
-        # att: (B,K,H,W) ; proj: ModuleList or Conv2d
-        if isinstance(proj, nn.ModuleList):
-            out = 0.0
-            for i in range(att.shape[1]):
-                out = out + proj[i](att[:, i:i+1])
-            return out
-        else:
-            return proj(att)
-
-    def _apply_head_act(self, x, kind: Optional[str]):
-        if kind is None:
-            return x
-        k = kind.lower() if isinstance(kind, str) else None
-        if k == 'sigmoid': return torch.sigmoid(x)
-        if k == 'tanh':    return torch.tanh(x)
-        if k == 'relu':    return F.relu(x, inplace=False)
-        return x
-
-    def _fit_param_budget(self, target_params: int, in_ch: int, out_ch: int):
-        lo, hi = 0.25, self.width_mult
-        best = self.width_mult
-        for _ in range(10):
-            mid = (lo + hi) / 2
-            self.width_mult = mid
-            C = max(3, int(round(self.base_channels * self.width_mult)))
-            self.C = C
-
-            self.chroma_stem = nn.Conv2d(max(1,self.K_C), C, 1, 1, 0, bias=True)
-
-            if not self.use_haar_edge_illum:
-                self.illum_stem  = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
-                self.illum_mid_seq = self._make_stack_blocks(
-                    C, C, depth=self.illum_mid_seq.__len__() if isinstance(self.illum_mid_seq, nn.Sequential) else 0)
-                if self.per_illum_proj:
-                    self.illum_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,self.K_L))])
-                else:
-                    self.illum_att_proj = nn.Conv2d(max(1,self.K_L), C, 1, 1, 0, bias=True)
-                self.head_luma = nn.Conv2d(C, 1, kernel_size=1, bias=True)
-
-            self.chroma_mid_seq = self._make_stack_blocks(
-                C, C, depth=self.chroma_mid_seq.__len__() if isinstance(self.chroma_mid_seq, nn.Sequential) else 0)
-            self.head_chroma = nn.Conv2d(C, out_ch, kernel_size=1, bias=True)
-
-            if self.per_chroma_proj:
-                self.chroma_att_proj = nn.ModuleList([nn.Conv2d(1, C, 1, 1, 0, bias=True) for _ in range(max(1,self.K_C))])
-            else:
-                self.chroma_att_proj = nn.Conv2d(max(1,self.K_C), C, 1, 1, 0, bias=True)
-
-            p = count_params(self)
-            if p <= target_params:
-                best = mid
-                lo = mid
-            else:
-                hi = mid
-        self.width_mult = best
-
-    # ---- forward (with direct attention application) ----
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, _, H_init, W_init = x.shape
-        rgb_in = x
-        B, Cin, H, W = x.shape
-
-        C_stack = self.chroma_extractor(x)
-        if C_stack.shape[1] == 0:
-            C_stack = x.new_zeros(B,1,H,W)
-
-        fC = self.chroma_stem(C_stack)
-
-        if self.use_chroma_attn:
-            C_att = self.chroma_att(C_stack)
-            C_mask = torch.sigmoid(self._att_project_to_C(C_att, self.chroma_att_proj))
-            fC = fC * C_mask
-        fC = self.chroma_mid_seq(fC)
-
-        if self.use_haar_edge_illum:
-            L_stack = self.illum_extractor(x)
-            if L_stack.shape[1] == 0:
-                L_stack = x.new_zeros(B, 1, H, W)
-            L_hat = self.haar_illum(L_stack) 
-        else:
-            L_stack = self.illum_extractor(x)
-            if L_stack.shape[1] == 0:
-                L_stack = x.new_zeros(B,1,H,W)
-            fL = self.illum_stem(L_stack)
-            if self.use_illum_attn:
-                L_att = self.illum_att(L_stack)
-                L_mask = torch.sigmoid(self._att_project_to_C(L_att, self.illum_att_proj))
-                fL = fL * L_mask
-            fL = self.illum_mid_seq(fL)
-            L_hat = self.head_luma(fL)
-            L_hat = self._apply_head_act(L_hat, self.luma_head_act)
-
-        C_hat = self.head_chroma(fC)
-        C_hat = self._apply_head_act(C_hat, self.chroma_head_act)
-
-        out = C_hat * L_hat
-        if self.retinex_residual:
-            out = out + rgb_in
-        return out
-    def param_count(self) -> int:
-        return count_params(self)
-
