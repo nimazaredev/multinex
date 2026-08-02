@@ -568,7 +568,7 @@ class MultinexNano(nn.Module):
         # ---- optional param budget auto-shrink
         if target_params is not None:
             self._fit_param_budget(target_params, in_ch, out_ch)
-`
+
     # ---- helpers (unchanged except we don’t build BN/act gates now)
     def _make_block(self, c_in, c_out):
         if self.use_depthwise:
