@@ -381,6 +381,7 @@ class ChrominanceExtractor(nn.Module):
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
 
+
 class HaarDWT2D(nn.Module):
     """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups.
     """
@@ -414,6 +415,55 @@ class HaarDWT2D(nn.Module):
         LH = out[:, :, 2]
         HH = out[:, :, 3]
         return LL, HL, LH, HH
+
+
+class HaarEdgeIllumination(nn.Module):
+    """
+    Hybrid Wavelet-Multinex Illumination:
+    Applies Haar DWT over the full Multinex L_stack (e.g., 4 channels).
+    Total Params for 4 channels: (3x3x4) + (1x1x4) = 36 + 4 = 40 parameters.
+    """
+    def __init__(self, in_channels: int = 4, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dwt = HaarDWT2D(in_channels=in_channels)
+        
+        # DWConv for spatial smoothing per channel (3x3, groups=in_channels, no bias)
+        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
+        # Smart Initialization: acts as an average pool initially
+        nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
+        
+        # 1x1 Conv to fuse the 4 priors into 1 illumination map
+        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=False)
+        # Smart Initialization: simple channel averaging initially
+        nn.init.constant_(self.fuse_conv.weight, 1.0 / in_channels)
+
+    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
+        # L_stack is now (B, 4, H, W) directly from illum_extractor
+        B, C, H, W = L_stack.shape
+
+        LL, HL, LH, HH = self.dwt(L_stack)
+
+        # Edge Energy (B, 4, H/2, W/2)
+        edge_energy = HL.abs() + LH.abs() + HH.abs()
+
+        # Upsample back to original resolution
+        LL_up = F.interpolate(LL, size=(H, W), mode='bilinear', align_corners=False)
+        edge_up = F.interpolate(edge_energy, size=(H, W), mode='bilinear', align_corners=False)
+
+        # Modulate Base with Edges
+        m_edge = torch.sigmoid(edge_up)
+        f_modulated = LL_up * (1.0 + m_edge)
+
+        # Smooth and Fuse
+        delta_L_raw = self.dw_conv(f_modulated)       # (B, 4, H, W)
+        delta_L_fused = self.fuse_conv(delta_L_raw)   # (B, 1, H, W)
+        
+        # Bounding final illumination
+        delta_L = torch.sigmoid(delta_L_fused)
+        return delta_L
+
+
 
 
 class MultinexNano(nn.Module):
