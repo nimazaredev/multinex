@@ -410,45 +410,59 @@ class HaarDWT2D(nn.Module):
         LL, HL, LH, HH = out[:, 0:1], out[:, 1:2], out[:, 2:3], out[:, 3:4]
         return LL, HL, LH, HH
 
-
 class HaarEdgeIllumination(nn.Module):
     """
-    Y_vmax = max(R,G,B)
-    LL,HL,LH,HH = Haar_DWT(Y_vmax)
-    Delta_L_base = conv3x3(LL)                                (half-res)
-    M_edge       = sigmoid(conv3x3(|HL|+|LH|+|HH|))           (half-res)
-    Delta_L = conv3x3(Upsample(Delta_L_base)) * (1 + Upsample(M_edge))
-
-    Ultra-lightweight: three single-channel 3x3 convs (~9+1 params each).
+    Wavelet-based illumination dictation.
+    Extracts LL (base) and High-Frequency (edges) from Y_vmax.
+    Modulates the base with edge energy, upsamples, and smoothes with a single DWConv.
+    
+    Total parameters: Exactly 9 (1 DWConv 3x3, no bias).
     """
     def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.dwt = HaarDWT2D()
-        self.base_conv    = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
-        self.edge_conv    = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
-        self.post_up_conv = nn.Conv2d(1, 1, 3, 1, 1, bias=True)
+        
+        # تنها یک لایه Depthwise Conv بدون بایاس برای حفظ بودجه ۹ پارامتری
+        self.dw_conv = nn.Conv2d(
+            in_channels=1, 
+            out_channels=1, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1, 
+            groups=1, 
+            bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         assert C == 3, "HaarEdgeIllumination expects RGB input (B,3,H,W)"
 
+        # 1. استخراج کانال ماکزیمم
         R, G, Bc = x[:, 0:1], x[:, 1:2], x[:, 2:3]
         y_vmax = torch.maximum(R, torch.maximum(G, Bc))
 
+        # 2. تجزیه موجک هار (بدون پارامتر)
         LL, HL, LH, HH = self.dwt(y_vmax)
 
-        delta_L_base = self.base_conv(LL)
+        # 3. محاسبه انرژی لبه‌ها از باندهای بالاگذر
         edge_energy = HL.abs() + LH.abs() + HH.abs()
-        m_edge = torch.sigmoid(self.edge_conv(edge_energy))
 
-        delta_L_base_up = F.interpolate(delta_L_base, size=(H, W), mode='bilinear', align_corners=False)
-        m_edge_up = F.interpolate(m_edge, size=(H, W), mode='bilinear', align_corners=False)
+        # 4. آپ‌سمپلینگ Bilinear به رزولوشن اصلی (طبق پروپوزال)
+        LL_up = F.interpolate(LL, size=(H, W), mode='bilinear', align_corners=False)
+        edge_up = F.interpolate(edge_energy, size=(H, W), mode='bilinear', align_corners=False)
 
-        delta_L = self.post_up_conv(delta_L_base_up) * (1.0 + m_edge_up)
+        # 5. دیکته کردن لبه‌ها به نقشه روشنایی (Modulation)
+        m_edge = torch.sigmoid(edge_up)
+        f_modulated = LL_up * (1.0 + m_edge)
+
+        # 6. اعمال کانولوشن ۹ پارامتری برای نرم‌کردن نهایی
+        delta_L_raw = self.dw_conv(f_modulated)
+
+        # 7. اعمال تابع فعال‌ساز نهایی (بسیار مهم برای جلوگیری از انفجار L_hat)
+        delta_L = torch.sigmoid(delta_L_raw)
+        
         return delta_L
-
-
 
 
 
