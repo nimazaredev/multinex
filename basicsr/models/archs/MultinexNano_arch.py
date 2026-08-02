@@ -380,76 +380,115 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
-# RGB  - PSNR: 17.8132
 
 class HaarDWT2D(nn.Module):
-    def __init__(self, in_channels: int = 1):
+    """
+    تبدیل مستقیم موجک هار (بدون پارامتر یادگیرنده)
+    تصویر را به ۴ زیرباند فرکانسی تجزیه می‌کند.
+    """
+    def __init__(self, in_channels: int = 4):
         super().__init__()
         self.groups = in_channels
+        
+        # کرنل‌های تبدیل هار (اندازه: 4, 1, 2, 2)
         k = torch.tensor([
-            [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
-            [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
-            [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
-            [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
+            [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL (فرکانس پایین)
+            [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL (لبه‌های افقی)
+            [[[0.5,  0.5], [-0.5, -0.5]]],   # LH (لبه‌های عمودی)
+            [[[0.5, -0.5], [-0.5,  0.5]]],   # HH (لبه‌های قطری)
         ], dtype=torch.float32)
         
+        # تکرار کرنل‌ها برای هر کانال ورودی (گروه‌بندی شده)
         k = k.repeat(in_channels, 1, 1, 1)
         self.register_buffer("kernel", k)
 
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.shape
         pad_h, pad_w = H % 2, W % 2
+        
+        # پدینگ بازتابی در صورت فرد بودن ابعاد
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
             
         out = F.conv2d(x, self.kernel, stride=2, groups=self.groups)
+        
+        # جداسازی زیرباندها به تفکیک کانال
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
         return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
 
 
-class HaarEdgeIllumination(nn.Module):
-    def __init__(self, in_channels: int = 4, eps: float = 1e-6):
+class HaarIDWT2D(nn.Module):
+    """
+    تبدیل معکوس موجک هار قطعی (بدون پارامتر یادگیرنده)
+    هر ۴ زیرباند را گرفته و تصویر اصلی را بدون افت کیفیت بازسازی می‌کند.
+    """
+    def __init__(self, in_channels: int = 4):
         super().__init__()
-        self.eps = eps
+        self.groups = in_channels
+        
+        # کرنل‌های معکوس هار (دقیقاً مشابه مقادیر مستقیم برای بازسازی کامل)
+        # ابعاد وزن برای conv_transpose2d در حالت groups: (in_channels, out_channels/groups, H, W)
+        k = torch.tensor([
+            [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
+            [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
+            [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
+            [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
+        ], dtype=torch.float32)
+
+        k = k.repeat(in_channels, 1, 1, 1)
+        self.register_buffer("kernel", k)
+
+    def forward(self, LL, HL, LH, HH):
+        B, C, H, W = LL.shape
+        
+        # ترکیب زیرباندها و تغییر شکل برای ورود به conv_transpose2d
+        # شکل نهایی: (B, C*4, H, W)
+        x = torch.stack([LL, HL, LH, HH], dim=2)
+        x = x.view(B, C * 4, H, W)
+
+        # بازسازی مکانی از طریق کانولوشن ترانهاده قطعی
+        out = F.conv_transpose2d(x, self.kernel, stride=2, groups=self.groups)
+        return out
+
+
+class HaarEdgeIllumination(nn.Module):
+    """
+    ماژول اصلی کشف و مدولاسیون لبه در حوزه موجک
+    بودجه محاسباتی: تنها ۴۱ پارامتر!
+    """
+    def __init__(self, in_channels: int = 4):
+        super().__init__()
+        # تبدیل مستقیم و معکوس (0 پارامتر)
         self.dwt = HaarDWT2D(in_channels=in_channels)
+        self.idwt = HaarIDWT2D(in_channels=in_channels)
         
-        # 1. Learnable IDWT instead of Bilinear (Only 16 parameters!)
-        self.idwt_conv = nn.ConvTranspose2d(
-            in_channels, in_channels, kernel_size=2, stride=2, 
-            groups=in_channels, bias=False
-        )
-        # Initialize with standard IDWT scale
-        nn.init.constant_(self.idwt_conv.weight, 0.5)
-        
-        # 2. DWConv for spatial smoothing
+        # هموارسازی مکانی (36 پارامتر)
         self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
         nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
         
-        # 3. Final Fusion (Dynamic channel weighting)
+        # ادغام نهایی کانال‌ها (5 پارامتر)
         self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        nn.init.kaiming_normal_(self.fuse_conv.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(self.fuse_conv.weight, 0.0)
         nn.init.constant_(self.fuse_conv.bias, 0.0)
 
     def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # L_stack shape: (B, 4, H, W)
+        # 1. انتقال به فضای فرکانس
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        # Calculate Edge Energy in Frequency Domain (H/2, W/2)
+        # 2. محاسبه انرژی لبه با استفاده از قدر مطلق فرکانس‌های بالا
         edge_energy = torch.sigmoid(HL.abs() + LH.abs() + HH.abs())
 
-        # Modulate the LL band BEFORE inverse transform
+        # 3. مدولاسیون باند روشنایی پایه بر اساس انرژی لبه
         LL_modulated = LL * (1.0 + edge_energy)
 
-        # Apply Learnable Inverse Haar Transform (Perfect Spatial Reconstruction)
-        L_up = self.idwt_conv(LL_modulated)
+        # 4. بازسازی کامل مکانی با ترکیب باند مدوله شده و باندهای ساختاری (فرکانس بالا)
+        L_up = self.idwt(LL_modulated, HL, LH, HH)
 
-        # Final Smoothing and Fusion
+        # 5. هموارسازی ناهنجاری‌های احتمالی و ادغام کانال‌ها
         L_smoothed = self.dw_conv(L_up)
         delta_L = self.fuse_conv(L_smoothed)
         
         return delta_L
-
-
 
 
 class MultinexNano(nn.Module):
