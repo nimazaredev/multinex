@@ -382,16 +382,20 @@ class ChrominanceExtractor(nn.Module):
 
 
 class HaarDWT2D(nn.Module):
+    """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups.
+    """
     def __init__(self, in_channels: int = 1):
         super().__init__()
         self.groups = in_channels
+        # 2x2 blocks for Haar Transform
         k = torch.tensor([
             [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
             [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
             [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
             [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
-        ], dtype=torch.float32)
+        ], dtype=torch.float32)  # (4, 1, 2, 2)
         
+        # Repeat kernel for multiple channels (e.g., 4 channels -> 16 filters)
         k = k.repeat(in_channels, 1, 1, 1)
         self.register_buffer("kernel", k)
 
@@ -401,140 +405,15 @@ class HaarDWT2D(nn.Module):
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
             
-        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups)
+        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups) # (B, 4*C, H/2, W/2)
+        
+        # Reshape to (B, C, 4, H/2, W/2) for easy slicing
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
-        return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
-
-def inverse_haar_2d(LL, HL, LH, HH):
-    """
-    بازسازی کاملاً ریاضی و بدون پارامتر
-    """
-    B, C, H2, W2 = LL.shape
-    
-    TL = LL + HL + LH + HH
-    TR = LL - HL + LH - HH
-    BL = LL + HL - LH - HH
-    BR = LL - HL - LH + HH
-    
-    out = torch.empty(B, C, H2 * 2, W2 * 2, device=LL.device, dtype=LL.dtype)
-    out[:, :, 0::2, 0::2] = TL
-    out[:, :, 0::2, 1::2] = TR
-    out[:, :, 1::2, 0::2] = BL
-    out[:, :, 1::2, 1::2] = BR
-    
-    return out * 0.5
-
-class SoftThreshold(nn.Module):
-    """
-    آستانه‌گذاری نرم یادگیرنده برای حذف نویزهای فرکانس بالا (پواسون)
-    """
-    def __init__(self, channels: int, init_val: float = 0.01):
-        super().__init__()
-        # یک پارامتر بسیار سبک (tau) برای هر کانال
-        self.tau = nn.Parameter(torch.full((1, channels, 1, 1), init_val))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # فرمول: sgn(x) * max(|x| - tau, 0)
-        return torch.sign(x) * F.relu(x.abs() - self.tau)
-
-class HaarEdgeIlluminationV2(nn.Module):
-    def __init__(self, in_channels: int = 1):
-        super().__init__()
-        self.dwt = HaarDWT2D(in_channels=in_channels)
-        
-        # ماژول‌های حذف نویز برای دو سطح فرکانسی
-        self.soft_thresh_l1 = SoftThreshold(in_channels)
-        self.soft_thresh_l2 = SoftThreshold(in_channels)
-        
-        # فیلتر هموارساز مکان‌محور (فقط ۹ پارامتر برای هر کانال)
-        self.smooth_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
-        nn.init.constant_(self.smooth_conv.weight, 1.0 / 9.0)
-        
-        # لایه ترکیب نهایی
-        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        nn.init.constant_(self.fuse_conv.weight, 0.0)
-        nn.init.constant_(self.fuse_conv.bias, 0.0)
-
-    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # --- ۱. تجزیه آبشاری (Cascade Decomposition) ---
-        # سطح ۱ (رزولوشن ۱/۲)
-        LL1, HL1, LH1, HH1 = self.dwt(L_stack)
-        
-        # سطح ۲ (رزولوشن ۱/۴) - افزایش شدید میدان دید (Receptive Field) بدون پارامتر
-        LL2, HL2, LH2, HH2 = self.dwt(LL1)
-
-        # --- ۲. حذف نویز (Denoising) از باندهای بالاگذر ---
-        HL2_t = self.soft_thresh_l2(HL2)
-        LH2_t = self.soft_thresh_l2(LH2)
-        HH2_t = self.soft_thresh_l2(HH2)
-        
-        HL1_t = self.soft_thresh_l1(HL1)
-        LH1_t = self.soft_thresh_l1(LH1)
-        HH1_t = self.soft_thresh_l1(HH1)
-
-        # --- ۳. بازسازی تصویر (Reconstruction) ---
-        # بازسازی لایه اول از روی لایه دوم (با لبه‌های فیلتر شده)
-        L1_recon = inverse_haar_2d(LL2, HL2_t, LH2_t, HH2_t)
-        
-        # بازسازی نهایی به رزولوشن اصلی
-        L0_recon = inverse_haar_2d(L1_recon, HL1_t, LH1_t, HH1_t)
-
-        # --- ۴. تولید نقشه لبه و هموارسازی آگاه به لبه (Edge-Aware Gating) ---
-        # ساخت نقشه لبه در رزولوشن اصلی به صورت کاملاً ریاضی با قرار دادن LL=0
-        edge_map_hr = inverse_haar_2d(torch.zeros_like(LL1), HL1_t.abs(), LH1_t.abs(), HH1_t.abs())
-        edge_gate = torch.sigmoid(edge_map_hr) # مقادیر بین 0 (سطح صاف) و 1 (لبه تیز)
-        
-        # اعمال هموارساز روی تصویر بازسازی شده
-        L0_smoothed = self.smooth_conv(L0_recon)
-        
-        # ترفند اصلی ترکیب: 
-        # در لبه‌ها (edge_gate نزدیک به 1)، مقدار پیکسل دست‌نخورده باقی می‌ماند تا مرزها حفظ شوند.
-        # در نواحی صاف (edge_gate نزدیک به 0)، از خروجی هموارساز استفاده می‌شود.
-        L_final = (edge_gate * L0_recon) + ((1.0 - edge_gate) * L0_smoothed)
-
-        # --- ۵. خروجی نهایی ---
-        delta_L = self.fuse_conv(L_final)
-        
-        return delta_L
-
-
-
-class HaarEdgeIllumination(nn.Module):
-    def __init__(self, in_channels: int = 4, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dwt = HaarDWT2D(in_channels=in_channels)
-        
-        # DWConv for spatial smoothing of the final map
-        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
-        nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
-        
-        # Final Fusion
-        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        nn.init.constant_(self.fuse_conv.weight, 0.0)
-        nn.init.constant_(self.fuse_conv.bias, 0.0)
-
-    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # 1. Forward Transform
-        LL, HL, LH, HH = self.dwt(L_stack)
-
-        # 2. Extract Edge Energy
-        edge_energy = torch.sigmoid(HL.abs() + LH.abs() + HH.abs())
-
-        # 3. Modulate the LL band in the frequency domain
-        LL_modulated = LL * (1.0 + edge_energy)
-        
-        # 4. Deterministic Mathematical Reconstruction (NO Upsampling Parameters)
-        # We pass ALL bands to reconstruct perfectly, but LL is now modulated (enhanced).
-        L_reconstructed = inverse_haar_2d(LL_modulated, HL, LH, HH)
-
-        # 5. Final Smoothing and Fusion
-        L_smoothed = self.dw_conv(L_reconstructed)
-        delta_L = self.fuse_conv(L_smoothed)
-        
-        return delta_L
-
-
+        LL = out[:, :, 0]
+        HL = out[:, :, 1]
+        LH = out[:, :, 2]
+        HH = out[:, :, 3]
+        return LL, HL, LH, HH
 
 
 class MultinexNano(nn.Module):
