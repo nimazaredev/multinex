@@ -385,7 +385,6 @@ class ChrominanceExtractor(nn.Module):
 
 
 
-
 class HaarDWT2D(nn.Module):
     """Fixed one-level orthonormal 2D Haar transform."""
 
@@ -458,39 +457,32 @@ class HaarReliabilityEstimator(nn.Module):
         3. Detail coefficients are clipped to the estimated noise range.
         4. C = mu / (mu + nu + tau).
 
-    The module has either zero learned parameters or one learned scalar (tau).
+    The module has no learned parameters. The reliability floor tau is fixed.
     """
 
     def __init__(
         self,
         noise_threshold: float = 2.5,
-        tau_init: float = 1e-3,
-        learnable_tau: bool = True,
+        tau: float = 1e-3,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if noise_threshold <= 0:
             raise ValueError("noise_threshold must be positive")
-        if tau_init <= 0:
-            raise ValueError("tau_init must be positive")
+        if tau <= 0:
+            raise ValueError("tau must be positive")
         if eps <= 0:
             raise ValueError("eps must be positive")
 
         self.noise_threshold = float(noise_threshold)
-        self.learnable_tau = bool(learnable_tau)
         self.eps = float(eps)
         self.dwt = HaarDWT2D(in_channels=1)
 
-        if self.learnable_tau:
-            # Initialize softplus(raw_tau) exactly at tau_init.
-            raw_tau = math.log(math.expm1(tau_init))
-            self.raw_tau = nn.Parameter(torch.tensor(raw_tau, dtype=torch.float32))
-        else:
-            self.register_buffer(
-                "fixed_tau",
-                torch.tensor(tau_init, dtype=torch.float32),
-                persistent=True,
-            )
+        self.register_buffer(
+            "fixed_tau",
+            torch.tensor(tau, dtype=torch.float32),
+            persistent=True,
+        )
 
         self.register_buffer(
             "rgb_to_luma",
@@ -501,11 +493,7 @@ class HaarReliabilityEstimator(nn.Module):
         )
 
     def _tau(self, reference: torch.Tensor) -> torch.Tensor:
-        if self.learnable_tau:
-            tau = F.softplus(self.raw_tau)
-        else:
-            tau = self.fixed_tau
-        return tau.to(device=reference.device, dtype=reference.dtype)
+        return self.fixed_tau.to(device=reference.device, dtype=reference.dtype)
 
     @staticmethod
     def _spatial_median(x: torch.Tensor) -> torch.Tensor:
@@ -608,14 +596,11 @@ class MultinexNano(nn.Module):
         chroma_head_act: Optional[str] = "tanh",
         retinex_residual: bool = True,
         eps: float = 1e-6,
-        # New reliability settings
-        use_haar_reliability: bool = True,
+        # Existing project flag. When True, it enables the new Haar-guided
+        # reliability-adaptive chromatic correction. No new boolean flag is used.
+        use_haar_edge_illum: bool = False,
         haar_noise_threshold: float = 2.5,
-        haar_tau_init: float = 1e-3,
-        learnable_haar_tau: bool = True,
-        # Backward-compatible alias for old configs. Its old illumination-replacement
-        # behavior is intentionally removed; True now enables the new reliability path.
-        use_haar_edge_illum: Optional[bool] = None,
+        haar_tau: float = 1e-3,
     ) -> None:
         super().__init__()
         if in_ch != 3 or out_ch != 3:
@@ -625,11 +610,6 @@ class MultinexNano(nn.Module):
             )
         if illum_mid < 0 or chroma_mid < 0:
             raise ValueError("illum_mid and chroma_mid must be non-negative")
-
-        if use_haar_edge_illum is not None:
-            # This preserves configuration compatibility without preserving the obsolete
-            # Haar illumination branch. The flag now selects the proposed method.
-            use_haar_reliability = bool(use_haar_edge_illum)
 
         self.use_depthwise = use_depthwise
         self.per_illum_proj = per_illum_proj
@@ -644,7 +624,7 @@ class MultinexNano(nn.Module):
         self.retinex_residual = retinex_residual
         self.use_illum_attn = use_illum_attn
         self.use_chroma_attn = use_chroma_attn
-        self.use_haar_reliability = use_haar_reliability
+        self.use_haar_edge_illum = bool(use_haar_edge_illum)
         self.illum_mid = illum_mid
         self.chroma_mid = chroma_mid
         self.out_ch = out_ch
@@ -657,11 +637,10 @@ class MultinexNano(nn.Module):
             self.K_L = self.illum_extractor(dummy).shape[1]
             self.K_C = self.chroma_extractor(dummy).shape[1]
 
-        if self.use_haar_reliability:
+        if self.use_haar_edge_illum:
             self.haar_reliability = HaarReliabilityEstimator(
                 noise_threshold=haar_noise_threshold,
-                tau_init=haar_tau_init,
-                learnable_tau=learnable_haar_tau,
+                tau=haar_tau,
                 eps=eps,
             )
         else:
@@ -774,30 +753,47 @@ class MultinexNano(nn.Module):
         raise ValueError(f"Unsupported head activation: {kind}")
 
     def _fit_param_budget(self, target_params: int) -> None:
+        """Choose the widest valid hidden width under the requested budget.
+
+        The new proposal preserves both original Multinex branches. Therefore an old
+        target_params value, tuned for the obsolete Haar illumination replacement, may
+        be lower than the new architecture's true minimum. In that case, use the
+        minimum valid width instead of aborting training, and report the actual count.
+        """
         if target_params <= 0:
             raise ValueError("target_params must be positive")
 
-        lo, hi = 0.25, self.width_mult
-        best = lo
-        for _ in range(10):
-            mid = (lo + hi) / 2.0
-            channels = max(3, int(round(self.base_channels * mid)))
+        max_channels = max(3, int(round(self.base_channels * self.width_mult)))
+        best_channels = None
+        best_params = None
+
+        # Search integer channel widths directly. This avoids binary-search errors caused
+        # by rounding width_mult to an integer channel count.
+        for channels in range(3, max_channels + 1):
             self._build_width_dependent_modules(channels)
-            if count_params(self) <= target_params:
-                best = mid
-                lo = mid
-            else:
-                hi = mid
+            params = count_params(self)
+            if params <= target_params:
+                best_channels = channels
+                best_params = params
 
-        self.width_mult = best
-        best_channels = max(3, int(round(self.base_channels * best)))
-        self._build_width_dependent_modules(best_channels)
-
-        if count_params(self) > target_params:
-            raise ValueError(
-                "target_params is below the minimum achievable size with the "
-                "current fixed modules and minimum hidden width."
+        if best_channels is None:
+            best_channels = 3
+            self._build_width_dependent_modules(best_channels)
+            best_params = count_params(self)
+            warnings.warn(
+                "target_params={} is below the minimum achievable parameter count "
+                "({}) for the reliability-adaptive architecture. Using the minimum "
+                "hidden width C=3 so training can proceed. Increase target_params or "
+                "remove it from the YAML if an exact budget is required.".format(
+                    target_params, best_params
+                ),
+                RuntimeWarning,
             )
+        else:
+            self._build_width_dependent_modules(best_channels)
+
+        self.C = best_channels
+        self.width_mult = best_channels / float(self.base_channels)
 
     def _extract_stacks(
         self, x: torch.Tensor
@@ -874,7 +870,7 @@ class MultinexNano(nn.Module):
             self.head_chroma(f_c), self.chroma_head_act
         )
 
-        if self.use_haar_reliability:
+        if self.use_haar_edge_illum:
             if return_aux:
                 reliability, reliability_stats = self.haar_reliability(
                     x, return_statistics=True
