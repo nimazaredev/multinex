@@ -381,7 +381,6 @@ class ChrominanceExtractor(nn.Module):
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
 class HaarDWT2D(nn.Module):
-    """Parameter-free 2D Haar DWT that supports arbitrary number of input channels via groups."""
     def __init__(self, in_channels: int = 1):
         super().__init__()
         self.groups = in_channels
@@ -403,11 +402,7 @@ class HaarDWT2D(nn.Module):
             
         out = F.conv2d(x, self.kernel, stride=2, groups=self.groups)
         out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
-        LL = out[:, :, 0]
-        HL = out[:, :, 1]
-        LH = out[:, :, 2]
-        HH = out[:, :, 3]
-        return LL, HL, LH, HH
+        return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
 
 
 class HaarEdgeIllumination(nn.Module):
@@ -416,44 +411,41 @@ class HaarEdgeIllumination(nn.Module):
         self.eps = eps
         self.dwt = HaarDWT2D(in_channels=in_channels)
         
-        # DWConv for spatial smoothing per channel
+        # 1. Learnable IDWT instead of Bilinear (Only 16 parameters!)
+        self.idwt_conv = nn.ConvTranspose2d(
+            in_channels, in_channels, kernel_size=2, stride=2, 
+            groups=in_channels, bias=False
+        )
+        # Initialize with standard IDWT scale
+        nn.init.constant_(self.idwt_conv.weight, 0.5)
+        
+        # 2. DWConv for spatial smoothing
         self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
         nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
         
-        # 1x1 Conv to fuse the 4 priors into 1 illumination map
+        # 3. Final Fusion (Dynamic channel weighting)
         self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        
-        # Zero-Initialization for Additive Residual Learning
-        # This ensures the network starts by predicting Delta_L ~ 0
         nn.init.constant_(self.fuse_conv.weight, 0.0)
         nn.init.constant_(self.fuse_conv.bias, 0.0)
 
     def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = L_stack.shape
-
+        # L_stack shape: (B, 4, H, W)
         LL, HL, LH, HH = self.dwt(L_stack)
 
-        # Edge Energy
-        edge_energy = HL.abs() + LH.abs() + HH.abs()
+        # Calculate Edge Energy in Frequency Domain (H/2, W/2)
+        edge_energy = torch.sigmoid(HL.abs() + LH.abs() + HH.abs())
 
-        # Upsampling
-        LL_up = F.interpolate(LL, size=(H, W), mode='bilinear', align_corners=False)
-        edge_up = F.interpolate(edge_energy, size=(H, W), mode='bilinear', align_corners=False)
+        # Modulate the LL band BEFORE inverse transform
+        LL_modulated = LL * (1.0 + edge_energy)
 
-        # 1. Smooth the base illumination FIRST (Matching proposal math)
-        LL_smoothed = self.dw_conv(LL_up)
+        # Apply Learnable Inverse Haar Transform (Perfect Spatial Reconstruction)
+        L_up = self.idwt_conv(LL_modulated)
 
-        # 2. Modulate with Edges SECOND to preserve sharpness
-        m_edge = torch.sigmoid(edge_up)
-        f_modulated = LL_smoothed * (1.0 + m_edge)
-
-        # 3. Fuse to single channel
-        delta_L = self.fuse_conv(f_modulated)
+        # Final Smoothing and Fusion
+        L_smoothed = self.dw_conv(L_up)
+        delta_L = self.fuse_conv(L_smoothed)
         
-        # CRITICAL FIX: No Sigmoid here! Allow Delta_L to be negative for flexible residual learning.
         return delta_L
-
-
 
 class MultinexNano(nn.Module):
     """
