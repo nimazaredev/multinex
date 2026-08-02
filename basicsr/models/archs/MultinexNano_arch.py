@@ -383,6 +383,20 @@ class ChrominanceExtractor(nn.Module):
 
 
 
+"""
+Haar-guided reliability-adaptive Multinex-Nano.
+
+The existing project is expected to provide:
+    IlluminationExtractor, ChrominanceExtractor,
+    DWSeparableConv, MSEFBlock, ConvBNAct, and count_params.
+
+The existing flag has exactly one meaning:
+    use_haar_edge_illum=False -> original Multinex-Nano baseline
+    use_haar_edge_illum=True  -> Haar-guided reliability-adaptive
+                                 chromatic correction
+
+No additional MultinexNano initialization option is introduced.
+"""
 
 
 
@@ -450,11 +464,11 @@ class HaarDWT2D(nn.Module):
 
 class HaarReliabilityEstimator(nn.Module):
     """
-    Fixed Haar-based reliability estimator with no trainable parameters.
+    Fixed Haar-based reliability estimator.
 
     The constants follow the proposal:
         noise threshold lambda = 2.5
-        uncertainty floor tau = 1e-3
+        uncertainty floor tau = softplus(t) (one learned scalar)
 
     Haar is used only to estimate reliability. It does not replace or
     reconstruct the Multinex illumination branch.
@@ -473,11 +487,11 @@ class HaarReliabilityEstimator(nn.Module):
             torch.tensor(2.5, dtype=torch.float32),
             persistent=True,
         )
-        self.register_buffer(
-            "tau",
-            torch.tensor(1e-3, dtype=torch.float32),
-            persistent=True,
-        )
+        
+        # Trainable parameter for the uncertainty floor, replacing the fixed buffer.
+        # Initialize t such that softplus(-6.9077) is approximately 1e-3.
+        self.t = nn.Parameter(torch.tensor(-6.9077, dtype=torch.float32))
+        
         self.register_buffer(
             "rgb_to_luma",
             torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(
@@ -533,7 +547,10 @@ class HaarReliabilityEstimator(nn.Module):
             (n_hl.square() + n_lh.square() + n_hh.square()) / 3.0
             + self.eps
         )
-        tau = self.tau.to(device=rgb.device, dtype=mu.dtype)
+        
+        # Calculate learnable tau floor
+        tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
+        
         confidence_half = mu / (mu + nu + tau)
         confidence = F.interpolate(
             confidence_half,
@@ -615,7 +632,10 @@ class MultinexNano(nn.Module):
         self.retinex_residual = bool(retinex_residual)
         self.use_illum_attn = bool(use_illum_attn)
         self.use_chroma_attn = bool(use_chroma_attn)
+        
+        # Flag is read normally, relying on the YAML parser to provide a boolean.
         self.use_haar_edge_illum = bool(use_haar_edge_illum)
+        
         self.illum_mid = int(illum_mid)
         self.chroma_mid = int(chroma_mid)
         self.out_ch = int(out_ch)
@@ -629,7 +649,6 @@ class MultinexNano(nn.Module):
             self.K_C = self.chroma_extractor(dummy).shape[1]
 
         # This module exists only when the existing YAML flag is True.
-        # It has no trainable parameters, so it does not alter target_params.
         self.haar_reliability = (
             HaarReliabilityEstimator(eps=self.eps)
             if self.use_haar_edge_illum
