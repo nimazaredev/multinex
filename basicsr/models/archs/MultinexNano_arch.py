@@ -10,7 +10,7 @@ import math
 import warnings
 from torch.nn.init import _calculate_fan_in_and_fan_out
 import math
-from typing import Optional, Dict
+from typing import Dict, Optional, Sequence, Tuple
 
 import os
 from pathlib import Path
@@ -380,90 +380,388 @@ class ChrominanceExtractor(nn.Module):
 
         return torch.cat(maps, dim=1) if maps else torch.zeros(B,0,H,W, device=x.device, dtype=x.dtype)
 
-class HaarDWT2D(nn.Module):
-    """
-    تبدیل مستقیم موجک هار (بدون پارامتر یادگیرنده)
-    """
-    def __init__(self, in_channels: int = 4):
-        super().__init__()
-        self.groups = in_channels
-        
-        # کرنل‌های استاندارد موجک هار (مقداردهی نرمال 0.5)
-        k = torch.tensor([
-            [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL (فرکانس پایین)
-            [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL (لبه‌های افقی)
-            [[[0.5,  0.5], [-0.5, -0.5]]],   # LH (لبه‌های عمودی)
-            [[[0.5, -0.5], [-0.5,  0.5]]],   # HH (لبه‌های قطری)
-        ], dtype=torch.float32)
-        
-        k = k.repeat(in_channels, 1, 1, 1)
-        self.register_buffer("kernel", k)
 
-    def forward(self, x: torch.Tensor):
-        B, C, H, W = x.shape
-        pad_h, pad_w = H % 2, W % 2
-        
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
-            
-        out = F.conv2d(x, self.kernel, stride=2, groups=self.groups)
-        out = out.view(B, self.groups, 4, out.shape[2], out.shape[3])
-        return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
+class HaarDWT2D(nn.Module):
+    """Fixed one-level 2-D orthonormal Haar analysis transform.
+
+    Input:
+        x: (B, C, H, W)
+
+    Output:
+        LL, HL, LH, HH, each with shape
+        (B, C, ceil(H / 2), ceil(W / 2)).
+
+    Naming convention used here:
+        HL: high-pass along image width (x direction)
+        LH: high-pass along image height (y direction)
+
+    Odd input sizes are padded on the bottom/right. The caller should crop the
+    inverse-transform output back to the original H and W.
+    """
+
+    def __init__(self, in_channels: int = 4, padding_mode: str = "reflect"):
+        super().__init__()
+        if in_channels < 1:
+            raise ValueError("in_channels must be at least 1")
+        if padding_mode not in {"reflect", "replicate"}:
+            raise ValueError("padding_mode must be 'reflect' or 'replicate'")
+
+        self.in_channels = int(in_channels)
+        self.groups = int(in_channels)
+        self.padding_mode = padding_mode
+
+        # 0.5 gives an orthonormal 2-D Haar transform for 2x2 blocks.
+        kernels = torch.tensor(
+            [
+                [[[0.5, 0.5], [0.5, 0.5]]],       # LL
+                [[[0.5, -0.5], [0.5, -0.5]]],     # HL
+                [[[0.5, 0.5], [-0.5, -0.5]]],     # LH
+                [[[0.5, -0.5], [-0.5, 0.5]]],     # HH
+            ],
+            dtype=torch.float32,
+        )
+        kernels = kernels.repeat(self.in_channels, 1, 1, 1)
+        self.register_buffer("kernel", kernels, persistent=True)
+
+    def _pad_to_even(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[-2:]
+        pad_h = h % 2
+        pad_w = w % 2
+        if not (pad_h or pad_w):
+            return x
+
+        # Reflection padding is undefined when a spatial dimension is 1.
+        mode = self.padding_mode
+        if mode == "reflect" and (h < 2 or w < 2):
+            mode = "replicate"
+        return F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x.ndim != 4:
+            raise ValueError(f"Expected a 4-D BCHW tensor, got shape {tuple(x.shape)}")
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Expected {self.in_channels} channels, got {x.shape[1]}"
+            )
+
+        x_even = self._pad_to_even(x)
+        bands = F.conv2d(
+            x_even,
+            self.kernel.to(dtype=x.dtype),
+            stride=2,
+            groups=self.groups,
+        )
+        b, _, h2, w2 = bands.shape
+        bands = bands.reshape(b, self.in_channels, 4, h2, w2)
+        return bands[:, :, 0], bands[:, :, 1], bands[:, :, 2], bands[:, :, 3]
+
+
+class HaarIDWT2D(nn.Module):
+    """Fixed inverse matching :class:`HaarDWT2D` exactly."""
+
+    def __init__(self, out_channels: int = 4):
+        super().__init__()
+        if out_channels < 1:
+            raise ValueError("out_channels must be at least 1")
+
+        self.out_channels = int(out_channels)
+        kernels = torch.tensor(
+            [
+                [[[0.5, 0.5], [0.5, 0.5]]],       # LL
+                [[[0.5, -0.5], [0.5, -0.5]]],     # HL
+                [[[0.5, 0.5], [-0.5, -0.5]]],     # LH
+                [[[0.5, -0.5], [-0.5, 0.5]]],     # HH
+            ],
+            dtype=torch.float32,
+        )
+        kernels = kernels.repeat(self.out_channels, 1, 1, 1)
+        self.register_buffer("kernel", kernels, persistent=True)
+
+    def forward(
+        self,
+        ll: torch.Tensor,
+        hl: torch.Tensor,
+        lh: torch.Tensor,
+        hh: torch.Tensor,
+        output_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        shapes = {tuple(t.shape) for t in (ll, hl, lh, hh)}
+        if len(shapes) != 1:
+            raise ValueError("LL, HL, LH and HH must have identical shapes")
+        if ll.ndim != 4 or ll.shape[1] != self.out_channels:
+            raise ValueError(
+                f"Expected BCHW bands with C={self.out_channels}, got {tuple(ll.shape)}"
+            )
+
+        b, c, h, w = ll.shape
+        packed = torch.stack((ll, hl, lh, hh), dim=2).reshape(b, c * 4, h, w)
+        reconstructed = F.conv_transpose2d(
+            packed,
+            self.kernel.to(dtype=ll.dtype),
+            stride=2,
+            groups=self.out_channels,
+        )
+
+        if output_size is not None:
+            out_h, out_w = output_size
+            if out_h < 1 or out_w < 1:
+                raise ValueError("output_size values must be positive")
+            reconstructed = reconstructed[..., :out_h, :out_w]
+        return reconstructed
+
+
+class PositiveDepthwiseSmoothing(nn.Module):
+    """Trainable depthwise smoothing with positive, sum-to-one kernels.
+
+    The unconstrained logits are trainable, while spatial softmax guarantees
+    that each channel kernel remains a convex averaging filter. For C=4 and a
+    3x3 kernel this layer has 36 trainable parameters.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        padding_mode: str = "reflect",
+    ):
+        super().__init__()
+        if channels < 1:
+            raise ValueError("channels must be at least 1")
+        if kernel_size % 2 == 0 or kernel_size < 1:
+            raise ValueError("kernel_size must be a positive odd number")
+        if padding_mode not in {"reflect", "replicate"}:
+            raise ValueError("padding_mode must be 'reflect' or 'replicate'")
+
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.padding = kernel_size // 2
+        self.padding_mode = padding_mode
+
+        # Equal logits -> uniform averaging kernel at initialization.
+        self.logits = nn.Parameter(
+            torch.zeros(self.channels, 1, kernel_size, kernel_size)
+        )
+
+    def normalized_kernel(self) -> torch.Tensor:
+        flat = self.logits.flatten(start_dim=2)
+        return torch.softmax(flat, dim=-1).view_as(self.logits)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"Expected BCHW tensor with C={self.channels}, got {tuple(x.shape)}"
+            )
+
+        mode = self.padding_mode
+        if mode == "reflect" and (
+            x.shape[-2] <= self.padding or x.shape[-1] <= self.padding
+        ):
+            mode = "replicate"
+        x_pad = F.pad(
+            x,
+            (self.padding, self.padding, self.padding, self.padding),
+            mode=mode,
+        )
+        return F.conv2d(
+            x_pad,
+            self.normalized_kernel().to(dtype=x.dtype),
+            groups=self.channels,
+        )
+
 
 class HaarEdgeIllumination(nn.Module):
+    """Refined 44-parameter Haar illumination-correction module for C=4.
+
+    Pipeline:
+        1. Fixed Haar DWT.
+        2. Robust per-image/per-channel noise estimation from HH using MAD.
+        3. Adaptive soft thresholding of HL, LH and HH.
+        4. Edge confidence computed from the denoised detail coefficients.
+        5. Exact fixed Haar IDWT to obtain denoised guidance X_d.
+        6. Constrained depthwise smoothing to obtain X_s.
+        7. Edge-aware blend: Z = E * X_d + (1-E) * X_s.
+        8. 1x1 channel fusion and bounded correction Delta_L.
+
+    Trainable parameters for in_channels=4:
+        threshold multipliers: 3
+        positive 3x3 depthwise smoothing kernels: 4*9 = 36
+        1x1 fusion with bias: 4+1 = 5
+        total: 44
     """
-    ماژول اصلاح‌شده مدولاسیون فرکانسی روشنایی (۵۸ پارامتر)
-    """
-    def __init__(self, in_channels: int = 4, eps: float = 1e-6): # <--- افزودن eps برای سازگاری با API
+
+    _MAD_NORMALIZER = 0.6744897501960817
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        eps: float = 1e-6,
+        threshold_init: Sequence[float] = (1.0, 1.0, 1.0),
+        edge_rho: float = 1.0,
+        delta_max: float = 1.0,
+        detach_noise_estimate: bool = True,
+        padding_mode: str = "reflect",
+    ):
         super().__init__()
-        self.eps = eps
-        self.dwt = HaarDWT2D(in_channels=in_channels)
-        
-        # ضریب قابل یادگیری برای کنترل شدت مدولاسیون لبه‌ها (۱ پارامتر)
-        self.edge_scale = nn.Parameter(torch.tensor([0.1]))
-        
-        # ۱. بازسازی یادگیرنده به جای IDWT ثابت (۱۶ پارامتر)
-        self.learnable_idwt = nn.ConvTranspose2d(
-            in_channels * 4, in_channels, kernel_size=2, stride=2, groups=in_channels, bias=False
+        if in_channels < 1:
+            raise ValueError("in_channels must be at least 1")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+        if edge_rho <= 0:
+            raise ValueError("edge_rho must be positive")
+        if delta_max <= 0:
+            raise ValueError("delta_max must be positive")
+
+        threshold_tensor = torch.as_tensor(threshold_init, dtype=torch.float32)
+        if threshold_tensor.numel() == 1:
+            threshold_tensor = threshold_tensor.repeat(3)
+        if threshold_tensor.numel() != 3 or torch.any(threshold_tensor <= 0):
+            raise ValueError("threshold_init must contain three positive values")
+
+        self.in_channels = int(in_channels)
+        self.eps = float(eps)
+        self.edge_rho = float(edge_rho)
+        self.delta_max = float(delta_max)
+        self.detach_noise_estimate = bool(detach_noise_estimate)
+
+        self.dwt = HaarDWT2D(in_channels, padding_mode=padding_mode)
+        self.idwt = HaarIDWT2D(in_channels)
+
+        # Positive threshold multipliers lambda_k = softplus(a_k).
+        raw_init = torch.log(torch.expm1(threshold_tensor.clamp_min(1e-4)))
+        self.raw_threshold_scales = nn.Parameter(raw_init)
+
+        self.smoother = PositiveDepthwiseSmoothing(
+            in_channels,
+            kernel_size=3,
+            padding_mode=padding_mode,
         )
-        with torch.no_grad():
-            k_idwt = torch.tensor([
-                [[[0.5,  0.5], [ 0.5,  0.5]]],   # LL
-                [[[0.5, -0.5], [ 0.5, -0.5]]],   # HL
-                [[[0.5,  0.5], [-0.5, -0.5]]],   # LH
-                [[[0.5, -0.5], [-0.5,  0.5]]],   # HH
-            ], dtype=torch.float32).repeat(in_channels, 1, 1, 1)
-            self.learnable_idwt.weight.copy_(k_idwt)
 
-        # ۲. هموارسازی مکانی (۳۶ پارامتر)
-        self.dw_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False)
-        nn.init.constant_(self.dw_conv.weight, 1.0 / 9.0)
-        
-        # ۳. ادغام نهایی کانال‌ها (۵ پارامتر)
-        self.fuse_conv = nn.Conv2d(in_channels, 1, 1, 1, 0, bias=True)
-        nn.init.kaiming_uniform_(self.fuse_conv.weight, a=1)
-        nn.init.constant_(self.fuse_conv.bias, 0.0)
+        self.fuse_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
+        # A small non-zero initialization keeps the residual model close to the
+        # identity while allowing gradients to reach the chroma branch.
+        nn.init.constant_(self.fuse_conv.weight, 1e-3 / in_channels)
+        nn.init.zeros_(self.fuse_conv.bias)
 
-    def forward(self, L_stack: torch.Tensor) -> torch.Tensor:
-        # ۱. انتقال به حوزه فرکانس
-        LL, HL, LH, HH = self.dwt(L_stack)
+    @property
+    def threshold_scales(self) -> torch.Tensor:
+        return F.softplus(self.raw_threshold_scales) + self.eps
 
-        # ۲. محاسبه انرژی لبه با Tanh
-        edge_energy = torch.tanh(HL.abs() + LH.abs() + HH.abs())
+    def _estimate_noise_mad(self, hh: torch.Tensor) -> torch.Tensor:
+        """Return robust sigma with shape (B, C, 1, 1)."""
+        flat = hh.flatten(start_dim=2)
+        center = flat.median(dim=2, keepdim=True).values
+        mad = (flat - center).abs().median(dim=2, keepdim=True).values
+        sigma = (mad / self._MAD_NORMALIZER).view(
+            hh.shape[0], hh.shape[1], 1, 1
+        )
+        if self.detach_noise_estimate:
+            sigma = sigma.detach()
+        return sigma
 
-        # ۳. مدولاسیون کنترل‌شده روشنایی پایه
-        LL_modulated = LL * (1.0 + self.edge_scale * edge_energy)
+    @staticmethod
+    def _soft_threshold(x: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * F.relu(x.abs() - threshold)
 
-        # ۴. بازسازی با ConvTranspose2d یادگیرنده
-        B, C, H, W = LL.shape
-        x_freq = torch.stack([LL_modulated, HL, LH, HH], dim=2).view(B, C * 4, H, W)
-        L_up = self.learnable_idwt(x_freq)
+    def forward(
+        self,
+        l_stack: torch.Tensor,
+        return_aux: bool = False,
+    ):
+        if l_stack.ndim != 4:
+            raise ValueError(
+                f"Expected a 4-D BCHW tensor, got shape {tuple(l_stack.shape)}"
+            )
+        if l_stack.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Expected {self.in_channels} channels, got {l_stack.shape[1]}"
+            )
 
-        # ۵. هموارسازی و همجوشی کانال‌ها
-        L_smoothed = self.dw_conv(L_up)
-        delta_L = self.fuse_conv(L_smoothed)
-        
-        return delta_L
+        original_size = l_stack.shape[-2:]
+
+        # 1) Fixed Haar analysis.
+        ll, hl, lh, hh = self.dwt(l_stack)
+
+        # 2) Robust noise estimate from the finest detail band.
+        sigma = self._estimate_noise_mad(hh)
+
+        # 3) Direction-specific adaptive soft thresholds.
+        lambdas = self.threshold_scales
+        tau_hl = lambdas[0].view(1, 1, 1, 1) * sigma
+        tau_lh = lambdas[1].view(1, 1, 1, 1) * sigma
+        tau_hh = lambdas[2].view(1, 1, 1, 1) * sigma
+
+        hl_d = self._soft_threshold(hl, tau_hl)
+        lh_d = self._soft_threshold(lh, tau_lh)
+        hh_d = self._soft_threshold(hh, tau_hh)
+
+        # 4) Signal-to-noise-normalized edge confidence after denoising.
+        detail_power = hl_d.square() + lh_d.square() + hh_d.square()
+        # Subtract sqrt(eps) so an exactly flat region gives D=0, not a
+        # falsely high confidence when sigma is also near zero.
+        detail_magnitude = (
+            torch.sqrt(detail_power + self.eps) - self.eps ** 0.5
+        ).clamp_min(0.0)
+        edge_per_channel = torch.tanh(
+            detail_magnitude / (self.edge_rho * sigma + self.eps)
+        )
+        edge_half = edge_per_channel.mean(dim=1, keepdim=True)
+
+        # 5) Exact fixed reconstruction of the denoised guidance.
+        x_d = self.idwt(ll, hl_d, lh_d, hh_d, output_size=original_size)
+
+        # 6) A guaranteed smoothing alternative.
+        x_s = self.smoother(x_d)
+
+        # 7) Preserve denoised details near reliable edges; smooth flat regions.
+        edge_full = F.interpolate(
+            edge_half,
+            size=original_size,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp_(0.0, 1.0)
+        z = edge_full * x_d + (1.0 - edge_full) * x_s
+
+        # 8) Fuse channels and bound the illumination correction.
+        q = self.fuse_conv(z)
+        delta_l = self.delta_max * torch.tanh(q)
+
+        if not return_aux:
+            return delta_l
+
+        aux = {
+            "sigma": sigma,
+            "threshold_scales": lambdas,
+            "thresholds": (tau_hl, tau_lh, tau_hh),
+            "denoised_bands": (hl_d, lh_d, hh_d),
+            "edge_confidence_half": edge_half,
+            "edge_confidence": edge_full,
+            "x_denoised": x_d,
+            "x_smoothed": x_s,
+            "fused_features": z,
+        }
+        return delta_l, aux
+
+    def trainable_parameter_count(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def verify_haar_reconstruction(
+    channels: int = 4,
+    height: int = 63,
+    width: int = 65,
+    device: Optional[torch.device] = None,
+) -> float:
+    """Return max absolute DWT->IDWT error, including odd-size crop logic."""
+    device = device or torch.device("cpu")
+    dwt = HaarDWT2D(channels).to(device)
+    idwt = HaarIDWT2D(channels).to(device)
+    x = torch.randn(2, channels, height, width, device=device)
+    bands = dwt(x)
+    x_hat = idwt(*bands, output_size=(height, width))
+    return float((x_hat - x).abs().max().item())
+
 
 class MultinexNano(nn.Module):
     """
@@ -471,7 +769,10 @@ class MultinexNano(nn.Module):
       Branch = pre_blocks -> [optional attention] -> mid_blocks -> post_blocks
       Illum:  maps -> stem(C) -> pre -> (attn?) -> mid -> post -> head(1)
       Chroma: maps -> stem(C) -> pre -> (attn?) -> mid -> post -> head(3)
-      Fusion: out = chroma3 * luma1   (+ optional residual)
+      Fusion: out = chroma3 * delta_luma1 (+ optional residual)
+
+    When use_haar_edge_illum=True, the illumination branch is replaced by the
+    refined fixed-DWT / adaptive-threshold / edge-aware-smoothing pipeline.
 
     All previous knobs preserved; new knobs add maximum flexibility.
     """
@@ -502,7 +803,11 @@ class MultinexNano(nn.Module):
              retinex_residual: bool = True,
              eps: float = 1e-6,
 
-             use_haar_edge_illum: bool = False,   # <-- NEW
+             use_haar_edge_illum: bool = False,
+             haar_threshold_init: Sequence[float] = (1.0, 1.0, 1.0),
+             haar_edge_rho: float = 1.0,
+             haar_delta_max: float = 1.0,
+             haar_detach_noise_estimate: bool = True,
              ):
         super().__init__()
         self.use_depthwise = use_depthwise
@@ -519,7 +824,7 @@ class MultinexNano(nn.Module):
 
         self.use_illum_attn = use_illum_attn
         self.use_chroma_attn = use_chroma_attn
-        self.use_haar_edge_illum = use_haar_edge_illum   # <-- NEW
+        self.use_haar_edge_illum = use_haar_edge_illum
 
         # ---- extractors
         self.illum_extractor = IlluminationExtractor(illum_flags)
@@ -540,8 +845,15 @@ class MultinexNano(nn.Module):
         self.chroma_stem = nn.Conv2d(max(1, K_C), C, kernel_size=1, bias=True)
 
         if self.use_haar_edge_illum:
-            # Pass the calculated K_L (which is 4 by default in Multinex)
-            self.haar_illum = HaarEdgeIllumination(in_channels=self.K_L, eps=eps)
+            # K_L is normally 4. max(1, K_L) also supports an empty extractor.
+            self.haar_illum = HaarEdgeIllumination(
+                in_channels=max(1, self.K_L),
+                eps=eps,
+                threshold_init=haar_threshold_init,
+                edge_rho=haar_edge_rho,
+                delta_max=haar_delta_max,
+                detach_noise_estimate=haar_detach_noise_estimate,
+            )
         else:
             self.illum_stem  = nn.Conv2d(max(1, K_L), C, kernel_size=1, bias=True)
 
@@ -692,5 +1004,4 @@ class MultinexNano(nn.Module):
         return out
     def param_count(self) -> int:
         return count_params(self)
-    
 
