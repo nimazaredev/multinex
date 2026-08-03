@@ -901,6 +901,8 @@ class MultinexNano(nn.Module):
         if x.ndim != 4 or x.shape[1] != 3:
             raise ValueError(f"Expected Bx3xHxW input, got {tuple(x.shape)}")
 
+
+        assert use_haar_edge_illum == True, "ERROR: use_haar_edge_illum is STILL FALSE in model init!"
         rgb_in = x
         l_stack, c_stack = self._extract_stacks(x)
 
