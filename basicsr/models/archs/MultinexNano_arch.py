@@ -571,7 +571,11 @@ class HaarReliabilityEstimator(nn.Module):
         # Calculate learnable tau floor
         tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
         
-        confidence_half = mu / (mu + nu + tau)
+        q98 = torch.quantile(mu.flatten(2), 0.98, dim=-1, keepdim=True).unsqueeze(-1)
+        mu_rel = mu / (q98 + self.eps)
+
+        # Robust confidence computation using relative luma
+        confidence_half = mu_rel / (mu_rel + nu + tau)
         confidence = F.interpolate(
             confidence_half,
             size=(height, width),
