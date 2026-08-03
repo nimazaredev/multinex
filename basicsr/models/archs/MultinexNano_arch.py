@@ -571,11 +571,23 @@ class HaarReliabilityEstimator(nn.Module):
         # Calculate learnable tau floor
         tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
         
-        q98 = torch.quantile(mu.flatten(2), 0.98, dim=-1, keepdim=True).unsqueeze(-1)
-        mu_rel = mu / (q98 + self.eps)
+       # 1. Local SNR calculation
+        snr = mu / (nu + self.eps)
 
-        # Robust confidence computation using relative luma
-        confidence_half = mu_rel / (mu_rel + nu + tau)
+        # 2. Per-image Z-score standardization (completely domain-invariant for OoD)
+        snr_flat = snr.flatten(2)
+        snr_mean = snr_flat.mean(dim=-1, keepdim=True).unsqueeze(-1)
+        snr_std = snr_flat.std(dim=-1, keepdim=True).unsqueeze(-1) + self.eps
+
+        snr_norm = (snr - snr_mean) / snr_std
+
+        # 3. Soft sigmoidal gating with a learnable scale parameter k
+        # Learnable scale initialized to 2.0 (stored as t_k)
+        if not hasattr(self, "t_k"):
+            self.t_k = nn.Parameter(torch.tensor(2.0, dtype=torch.float32, device=rgb.device))
+
+        k = F.softplus(self.t_k).to(device=rgb.device, dtype=mu.dtype)
+        confidence_half = torch.sigmoid(k * snr_norm)
         confidence = F.interpolate(
             confidence_half,
             size=(height, width),
