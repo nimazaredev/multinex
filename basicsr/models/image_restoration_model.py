@@ -242,115 +242,115 @@ class ImageCleanModel(BaseModel):
 
     def nondist_validation(self, dataloader, current_iter, tb_logger,
                        save_img, rgb2bgr, use_image):
-    dataset_name = dataloader.dataset.opt['name']
-    with_metrics = self.opt['val'].get('metrics') is not None
-    if with_metrics:
-        self.metric_results = {
-            metric: 0
-            for metric in self.opt['val']['metrics'].keys()
-        }
-
-    # --- NEW: accumulators for color + binned metrics ---
-    from basicsr.metrics import (
-        calculate_ciede2000, calculate_angular_error,
-        calculate_saturation_error, calculate_binned_metrics
-    )
-    color_metric_sums = {'ciede2000': 0.0, 'angular_err': 0.0, 'sat_err': 0.0}
-    bin_keys = None          # will be set on first image
-    bin_sums = {}            # key -> {'psnr':.., 'ciede2000':.., 'sat_err':.., 'count':..}
-    dark_flat_sums = {'ciede2000': 0.0, 'sat_err': 0.0, 'count': 0}
-    n_valid_dark_flat = 0
-
-    window_size = self.opt['val'].get('window_size', 0)
-    test = partial(self.pad_test, window_size) if window_size else self.nonpad_test
-    cnt = 0
-
-    for idx, val_data in enumerate(dataloader):
-        img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
-        self.feed_data(val_data)
-        test()
-
-        visuals = self.get_current_visuals()
-        sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
-        if 'gt' in visuals:
-            gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
-            del self.gt
-        del self.lq
-        del self.output
-        torch.cuda.empty_cache()
-
-        # ... (save_img block unchanged) ...
-
+        dataset_name = dataloader.dataset.opt['name']
+        with_metrics = self.opt['val'].get('metrics') is not None
         if with_metrics:
-            opt_metric = deepcopy(self.opt['val']['metrics'])
-            if use_image:
-                for name, opt_ in opt_metric.items():
-                    metric_type = opt_.pop('type')
-                    self.metric_results[name] += getattr(
-                        metric_module, metric_type)(sr_img, gt_img, **opt_)
-            else:
-                for name, opt_ in opt_metric.items():
-                    metric_type = opt_.pop('type')
-                    self.metric_results[name] += getattr(
-                        metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+            self.metric_results = {
+                metric: 0
+                for metric in self.opt['val']['metrics'].keys()
+            }
 
-            # --- NEW: color-accuracy metrics (always on uint8 sr_img/gt_img,
-            #           since CIEDE2000/saturation are defined on RGB space) ---
-            crop_border = self.opt['val'].get('crop_border', 0)
-            color_metric_sums['ciede2000'] += calculate_ciede2000(sr_img, gt_img, crop_border)
-            color_metric_sums['angular_err'] += calculate_angular_error(sr_img, gt_img, crop_border)
-            color_metric_sums['sat_err'] += calculate_saturation_error(sr_img, gt_img, crop_border)
+        # --- NEW: accumulators for color + binned metrics ---
+        from basicsr.metrics import (
+            calculate_ciede2000, calculate_angular_error,
+            calculate_saturation_error, calculate_binned_metrics
+        )
+        color_metric_sums = {'ciede2000': 0.0, 'angular_err': 0.0, 'sat_err': 0.0}
+        bin_keys = None          # will be set on first image
+        bin_sums = {}            # key -> {'psnr':.., 'ciede2000':.., 'sat_err':.., 'count':..}
+        dark_flat_sums = {'ciede2000': 0.0, 'sat_err': 0.0, 'count': 0}
+        n_valid_dark_flat = 0
 
-            # --- NEW: brightness/reliability interval binning ---
-            bin_result = calculate_binned_metrics(sr_img, gt_img, crop_border=crop_border)
-            if bin_keys is None:
-                bin_keys = list(bin_result['bins'].keys())
-                bin_sums = {k: {'psnr': 0.0, 'ciede2000': 0.0, 'sat_err': 0.0, 'n_valid': 0}
-                           for k in bin_keys}
+        window_size = self.opt['val'].get('window_size', 0)
+        test = partial(self.pad_test, window_size) if window_size else self.nonpad_test
+        cnt = 0
+
+        for idx, val_data in enumerate(dataloader):
+            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            self.feed_data(val_data)
+            test()
+
+            visuals = self.get_current_visuals()
+            sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
+            if 'gt' in visuals:
+                gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
+                del self.gt
+            del self.lq
+            del self.output
+            torch.cuda.empty_cache()
+
+            # ... (save_img block unchanged) ...
+
+            if with_metrics:
+                opt_metric = deepcopy(self.opt['val']['metrics'])
+                if use_image:
+                    for name, opt_ in opt_metric.items():
+                        metric_type = opt_.pop('type')
+                        self.metric_results[name] += getattr(
+                            metric_module, metric_type)(sr_img, gt_img, **opt_)
+                else:
+                    for name, opt_ in opt_metric.items():
+                        metric_type = opt_.pop('type')
+                        self.metric_results[name] += getattr(
+                            metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+
+                # --- NEW: color-accuracy metrics (always on uint8 sr_img/gt_img,
+                #           since CIEDE2000/saturation are defined on RGB space) ---
+                crop_border = self.opt['val'].get('crop_border', 0)
+                color_metric_sums['ciede2000'] += calculate_ciede2000(sr_img, gt_img, crop_border)
+                color_metric_sums['angular_err'] += calculate_angular_error(sr_img, gt_img, crop_border)
+                color_metric_sums['sat_err'] += calculate_saturation_error(sr_img, gt_img, crop_border)
+
+                # --- NEW: brightness/reliability interval binning ---
+                bin_result = calculate_binned_metrics(sr_img, gt_img, crop_border=crop_border)
+                if bin_keys is None:
+                    bin_keys = list(bin_result['bins'].keys())
+                    bin_sums = {k: {'psnr': 0.0, 'ciede2000': 0.0, 'sat_err': 0.0, 'n_valid': 0}
+                            for k in bin_keys}
+                for k in bin_keys:
+                    b = bin_result['bins'][k]
+                    if b['count'] > 0:
+                        bin_sums[k]['psnr'] += b['psnr'] if np.isfinite(b['psnr']) else 0.0
+                        bin_sums[k]['ciede2000'] += b['ciede2000']
+                        bin_sums[k]['sat_err'] += b['sat_err']
+                        bin_sums[k]['n_valid'] += 1
+
+                df = bin_result['dark_flat']
+                if df['count'] > 0:
+                    dark_flat_sums['ciede2000'] += df['ciede2000']
+                    dark_flat_sums['sat_err'] += df['sat_err']
+                    n_valid_dark_flat += 1
+
+            cnt += 1
+
+        current_metric = 0.
+        if with_metrics:
+            for metric in self.metric_results.keys():
+                self.metric_results[metric] /= cnt
+                current_metric = self.metric_results[metric]
+
+            # --- NEW: finalize color metrics ---
+            for k in color_metric_sums:
+                color_metric_sums[k] /= cnt
+            self.color_metric_results = color_metric_sums
+
+            # --- NEW: finalize binned metrics ---
             for k in bin_keys:
-                b = bin_result['bins'][k]
-                if b['count'] > 0:
-                    bin_sums[k]['psnr'] += b['psnr'] if np.isfinite(b['psnr']) else 0.0
-                    bin_sums[k]['ciede2000'] += b['ciede2000']
-                    bin_sums[k]['sat_err'] += b['sat_err']
-                    bin_sums[k]['n_valid'] += 1
+                nv = max(bin_sums[k]['n_valid'], 1)
+                bin_sums[k]['psnr'] /= nv
+                bin_sums[k]['ciede2000'] /= nv
+                bin_sums[k]['sat_err'] /= nv
+            self.bin_metric_results = bin_sums
 
-            df = bin_result['dark_flat']
-            if df['count'] > 0:
-                dark_flat_sums['ciede2000'] += df['ciede2000']
-                dark_flat_sums['sat_err'] += df['sat_err']
-                n_valid_dark_flat += 1
+            nvdf = max(n_valid_dark_flat, 1)
+            self.dark_flat_results = {
+                'ciede2000': dark_flat_sums['ciede2000'] / nvdf,
+                'sat_err': dark_flat_sums['sat_err'] / nvdf,
+            }
 
-        cnt += 1
+            self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
 
-    current_metric = 0.
-    if with_metrics:
-        for metric in self.metric_results.keys():
-            self.metric_results[metric] /= cnt
-            current_metric = self.metric_results[metric]
-
-        # --- NEW: finalize color metrics ---
-        for k in color_metric_sums:
-            color_metric_sums[k] /= cnt
-        self.color_metric_results = color_metric_sums
-
-        # --- NEW: finalize binned metrics ---
-        for k in bin_keys:
-            nv = max(bin_sums[k]['n_valid'], 1)
-            bin_sums[k]['psnr'] /= nv
-            bin_sums[k]['ciede2000'] /= nv
-            bin_sums[k]['sat_err'] /= nv
-        self.bin_metric_results = bin_sums
-
-        nvdf = max(n_valid_dark_flat, 1)
-        self.dark_flat_results = {
-            'ciede2000': dark_flat_sums['ciede2000'] / nvdf,
-            'sat_err': dark_flat_sums['sat_err'] / nvdf,
-        }
-
-        self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
-
-    return current_metric
+        return current_metric
 
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
