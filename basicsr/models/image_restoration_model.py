@@ -241,100 +241,159 @@ class ImageCleanModel(BaseModel):
             return 0.
 
     def nondist_validation(self, dataloader, current_iter, tb_logger,
-                           save_img, rgb2bgr, use_image):
-        dataset_name = dataloader.dataset.opt['name']
-        with_metrics = self.opt['val'].get('metrics') is not None
+                       save_img, rgb2bgr, use_image):
+    dataset_name = dataloader.dataset.opt['name']
+    with_metrics = self.opt['val'].get('metrics') is not None
+    if with_metrics:
+        self.metric_results = {
+            metric: 0
+            for metric in self.opt['val']['metrics'].keys()
+        }
+
+    # --- NEW: accumulators for color + binned metrics ---
+    from basicsr.metrics import (
+        calculate_ciede2000, calculate_angular_error,
+        calculate_saturation_error, calculate_binned_metrics
+    )
+    color_metric_sums = {'ciede2000': 0.0, 'angular_err': 0.0, 'sat_err': 0.0}
+    bin_keys = None          # will be set on first image
+    bin_sums = {}            # key -> {'psnr':.., 'ciede2000':.., 'sat_err':.., 'count':..}
+    dark_flat_sums = {'ciede2000': 0.0, 'sat_err': 0.0, 'count': 0}
+    n_valid_dark_flat = 0
+
+    window_size = self.opt['val'].get('window_size', 0)
+    test = partial(self.pad_test, window_size) if window_size else self.nonpad_test
+    cnt = 0
+
+    for idx, val_data in enumerate(dataloader):
+        img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+        self.feed_data(val_data)
+        test()
+
+        visuals = self.get_current_visuals()
+        sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
+        if 'gt' in visuals:
+            gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
+            del self.gt
+        del self.lq
+        del self.output
+        torch.cuda.empty_cache()
+
+        # ... (save_img block unchanged) ...
+
         if with_metrics:
-            self.metric_results = {
-                metric: 0
-                for metric in self.opt['val']['metrics'].keys()
-            }
-        # pbar = tqdm(total=len(dataloader), unit='image')
+            opt_metric = deepcopy(self.opt['val']['metrics'])
+            if use_image:
+                for name, opt_ in opt_metric.items():
+                    metric_type = opt_.pop('type')
+                    self.metric_results[name] += getattr(
+                        metric_module, metric_type)(sr_img, gt_img, **opt_)
+            else:
+                for name, opt_ in opt_metric.items():
+                    metric_type = opt_.pop('type')
+                    self.metric_results[name] += getattr(
+                        metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
 
-        window_size = self.opt['val'].get('window_size', 0)
+            # --- NEW: color-accuracy metrics (always on uint8 sr_img/gt_img,
+            #           since CIEDE2000/saturation are defined on RGB space) ---
+            crop_border = self.opt['val'].get('crop_border', 0)
+            color_metric_sums['ciede2000'] += calculate_ciede2000(sr_img, gt_img, crop_border)
+            color_metric_sums['angular_err'] += calculate_angular_error(sr_img, gt_img, crop_border)
+            color_metric_sums['sat_err'] += calculate_saturation_error(sr_img, gt_img, crop_border)
 
-        if window_size:
-            test = partial(self.pad_test, window_size)
-        else:
-            test = self.nonpad_test
+            # --- NEW: brightness/reliability interval binning ---
+            bin_result = calculate_binned_metrics(sr_img, gt_img, crop_border=crop_border)
+            if bin_keys is None:
+                bin_keys = list(bin_result['bins'].keys())
+                bin_sums = {k: {'psnr': 0.0, 'ciede2000': 0.0, 'sat_err': 0.0, 'n_valid': 0}
+                           for k in bin_keys}
+            for k in bin_keys:
+                b = bin_result['bins'][k]
+                if b['count'] > 0:
+                    bin_sums[k]['psnr'] += b['psnr'] if np.isfinite(b['psnr']) else 0.0
+                    bin_sums[k]['ciede2000'] += b['ciede2000']
+                    bin_sums[k]['sat_err'] += b['sat_err']
+                    bin_sums[k]['n_valid'] += 1
 
-        cnt = 0
+            df = bin_result['dark_flat']
+            if df['count'] > 0:
+                dark_flat_sums['ciede2000'] += df['ciede2000']
+                dark_flat_sums['sat_err'] += df['sat_err']
+                n_valid_dark_flat += 1
 
-        for idx, val_data in enumerate(dataloader):
-            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
-            self.feed_data(val_data)
-            test()
+        cnt += 1
 
-            visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
-            if 'gt' in visuals:
-                gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
-                del self.gt
+    current_metric = 0.
+    if with_metrics:
+        for metric in self.metric_results.keys():
+            self.metric_results[metric] /= cnt
+            current_metric = self.metric_results[metric]
 
-            # tentative for out of GPU memory
-            del self.lq
-            del self.output
-            torch.cuda.empty_cache()
+        # --- NEW: finalize color metrics ---
+        for k in color_metric_sums:
+            color_metric_sums[k] /= cnt
+        self.color_metric_results = color_metric_sums
 
-            if save_img:
+        # --- NEW: finalize binned metrics ---
+        for k in bin_keys:
+            nv = max(bin_sums[k]['n_valid'], 1)
+            bin_sums[k]['psnr'] /= nv
+            bin_sums[k]['ciede2000'] /= nv
+            bin_sums[k]['sat_err'] /= nv
+        self.bin_metric_results = bin_sums
 
-                if self.opt['is_train']:
+        nvdf = max(n_valid_dark_flat, 1)
+        self.dark_flat_results = {
+            'ciede2000': dark_flat_sums['ciede2000'] / nvdf,
+            'sat_err': dark_flat_sums['sat_err'] / nvdf,
+        }
 
-                    save_img_path = osp.join(self.opt['path']['visualization'],
-                                             img_name,
-                                             f'{img_name}_{current_iter}.png')
+        self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
 
-                    save_gt_img_path = osp.join(self.opt['path']['visualization'],
-                                                img_name,
-                                                f'{img_name}_{current_iter}_gt.png')
-                else:
+    return current_metric
 
-                    save_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{img_name}.png')
-                    save_gt_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{img_name}_gt.png')
 
-                imwrite(sr_img, save_img_path)
-                imwrite(gt_img, save_gt_img_path)
+    def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
+    log_str = f'Validation {dataset_name},\t'
+    for metric, value in self.metric_results.items():
+        log_str += f'\t # {metric}: {value:.4f}'
+    logger = get_root_logger()
+    logger.info(log_str)
 
-            if with_metrics:
-                # calculate metrics
-                opt_metric = deepcopy(self.opt['val']['metrics'])
-                if use_image:
-                    for name, opt_ in opt_metric.items():
-                        metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(sr_img, gt_img, **opt_)
-                else:
-                    for name, opt_ in opt_metric.items():
-                        metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+    # --- NEW: color metrics line ---
+    if hasattr(self, 'color_metric_results'):
+        cm = self.color_metric_results
+        logger.info(
+            f'  [Color]  CIEDE2000: {cm["ciede2000"]:.4f}  '
+            f'AngularErr(deg): {cm["angular_err"]:.4f}  '
+            f'SatErr: {cm["sat_err"]:.4f}'
+        )
 
-            cnt += 1
+    # --- NEW: binned table ---
+    if hasattr(self, 'bin_metric_results'):
+        logger.info('  [Brightness-Bin Table]')
+        header = f'  {"Bin":>14} | {"PSNR":>8} | {"CIEDE2000":>10} | {"SatErr":>8}'
+        logger.info(header)
+        for k, v in self.bin_metric_results.items():
+            logger.info(f'  {k:>14} | {v["psnr"]:>8.3f} | {v["ciede2000"]:>10.3f} | {v["sat_err"]:>8.4f}')
 
-        current_metric = 0.
-        if with_metrics:
-            for metric in self.metric_results.keys():
-                self.metric_results[metric] /= cnt
-                current_metric = self.metric_results[metric]
+    # --- NEW: dark/flat region ---
+    if hasattr(self, 'dark_flat_results'):
+        df = self.dark_flat_results
+        logger.info(
+            f'  [Dark&Flat Regions]  CIEDE2000: {df["ciede2000"]:.4f}  SatErr: {df["sat_err"]:.4f}'
+        )
 
-            self._log_validation_metric_values(current_iter, dataset_name,
-                                               tb_logger)
-        return current_metric
-
-    def _log_validation_metric_values(self, current_iter, dataset_name,
-                                      tb_logger):
-        log_str = f'Validation {dataset_name},\t'
+    if tb_logger:
         for metric, value in self.metric_results.items():
-            log_str += f'\t # {metric}: {value:.4f}'
-        logger = get_root_logger()
-        logger.info(log_str)
-        if tb_logger:
-            for metric, value in self.metric_results.items():
-                tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+            tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+        if hasattr(self, 'color_metric_results'):
+            for k, v in self.color_metric_results.items():
+                tb_logger.add_scalar(f'metrics/color_{k}', v, current_iter)
+        if hasattr(self, 'bin_metric_results'):
+            for k, v in self.bin_metric_results.items():
+                tb_logger.add_scalar(f'metrics/bin_{k}_psnr', v['psnr'], current_iter)
+                tb_logger.add_scalar(f'metrics/bin_{k}_ciede2000', v['ciede2000'], current_iter)
 
     def get_current_visuals(self):
         out_dict = OrderedDict()

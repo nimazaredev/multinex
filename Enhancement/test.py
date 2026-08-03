@@ -74,6 +74,10 @@ print(f"dataset {args.dataset}")
 
 # LPIPS
 import lpips
+from basicsr.metrics.color_metrics import (
+    calculate_ciede2000, calculate_angular_error,
+    calculate_saturation_error, calculate_binned_metrics,
+)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 lpips_fn = lpips.LPIPS(net='alex').to(device)
 
@@ -157,6 +161,14 @@ lpips_list = []
 psnr_y_list, ssim_y_list = [], []      # <-- NEW
 psnr_c_list, ssim_c_list = [], []      # <-- NEW
 
+# --- NEW: color-accuracy accumulators ---
+ciede_list, ang_err_list, sat_err_list = [], [], []
+
+# --- NEW: brightness-bin accumulators (built lazily on first image) ---
+bin_keys = None
+bin_sums = {}   # key -> {'psnr':.., 'ciede2000':.., 'sat_err':.., 'n_valid':0}
+dark_flat_ciede_list, dark_flat_sat_list = [], []
+
 if dataset in ['SID', 'SMID', 'SDSD_indoor', 'SDSD_outdoor']:
     os.makedirs(result_dir_input, exist_ok=True)
     os.makedirs(result_dir_gt, exist_ok=True)
@@ -212,6 +224,31 @@ if dataset in ['SID', 'SMID', 'SDSD_indoor', 'SDSD_outdoor']:
             sy, sc = ssim_yc(target, restored)
             psnr_y_list.append(py); psnr_c_list.append(pc)
             ssim_y_list.append(sy); ssim_c_list.append(sc)
+
+
+            # --- NEW: color-accuracy metrics ---
+            ciede_list.append(calculate_ciede2000(restored, target))
+            ang_err_list.append(calculate_angular_error(restored, target))
+            sat_err_list.append(calculate_saturation_error(restored, target))
+
+            # --- NEW: brightness-bin metrics ---
+            bin_result = calculate_binned_metrics(restored, target)
+            if bin_keys is None:
+                bin_keys = list(bin_result['bins'].keys())
+                bin_sums = {k: {'psnr': 0.0, 'ciede2000': 0.0, 'sat_err': 0.0, 'n_valid': 0}
+                        for k in bin_keys}
+            for k in bin_keys:
+                b = bin_result['bins'][k]
+                if b['count'] > 0:
+                    bin_sums[k]['psnr'] += b['psnr'] if np.isfinite(b['psnr']) else 0.0
+                    bin_sums[k]['ciede2000'] += b['ciede2000']
+                    bin_sums[k]['sat_err'] += b['sat_err']
+                    bin_sums[k]['n_valid'] += 1
+
+            df = bin_result['dark_flat']
+            if df['count'] > 0:
+                dark_flat_ciede_list.append(df['ciede2000'])
+                dark_flat_sat_list.append(df['sat_err'])
 
             # save
             type_id = os.path.dirname(inp_path).split('/')[-1]
@@ -285,6 +322,30 @@ else:
             psnr_y_list.append(py); psnr_c_list.append(pc)
             ssim_y_list.append(sy); ssim_c_list.append(sc)
 
+            # --- NEW: color-accuracy metrics ---
+            ciede_list.append(calculate_ciede2000(restored, target))
+            ang_err_list.append(calculate_angular_error(restored, target))
+            sat_err_list.append(calculate_saturation_error(restored, target))
+
+            # --- NEW: brightness-bin metrics ---
+            bin_result = calculate_binned_metrics(restored, target)
+            if bin_keys is None:
+                bin_keys = list(bin_result['bins'].keys())
+                bin_sums = {k: {'psnr': 0.0, 'ciede2000': 0.0, 'sat_err': 0.0, 'n_valid': 0}
+                        for k in bin_keys}
+            for k in bin_keys:
+                b = bin_result['bins'][k]
+                if b['count'] > 0:
+                    bin_sums[k]['psnr'] += b['psnr'] if np.isfinite(b['psnr']) else 0.0
+                    bin_sums[k]['ciede2000'] += b['ciede2000']
+                    bin_sums[k]['sat_err'] += b['sat_err']
+                    bin_sums[k]['n_valid'] += 1
+
+            df = bin_result['dark_flat']
+            if df['count'] > 0:
+                dark_flat_ciede_list.append(df['ciede2000'])
+                dark_flat_sat_list.append(df['sat_err'])
+
             # save image
             save_base = os.path.splitext(os.path.split(inp_path)[-1])[0] + '.png'
             if output_dir != '':
@@ -309,6 +370,11 @@ ssim_y_mean = float(np.mean(ssim_y_list)) if ssim_y_list else float('nan')
 psnr_c_mean = float(np.mean(psnr_c_list)) if psnr_c_list else float('nan')
 ssim_c_mean = float(np.mean(ssim_c_list)) if ssim_c_list else float('nan')
 
+# --- NEW: color-accuracy means ---
+ciede_mean = float(np.mean(ciede_list)) if ciede_list else float('nan')
+ang_err_mean = float(np.mean(ang_err_list)) if ang_err_list else float('nan')
+sat_err_mean = float(np.mean(sat_err_list)) if sat_err_list else float('nan')
+
 print(f"RGB  - PSNR: {psnr_mean:.4f}")
 print(f"RGB  - SSIM: {ssim_mean:.4f}")
 print(f"LPIPS (alex): {lpips_mean:.6f}")
@@ -316,3 +382,28 @@ print(f"Y    - PSNR_y: {psnr_y_mean:.4f}")
 print(f"Y    - SSIM_y: {ssim_y_mean:.4f}")
 print(f"Ch   - PSNR_c: {psnr_c_mean:.4f}   (avg of Cb & Cr)")
 print(f"Ch   - SSIM_c: {ssim_c_mean:.4f}   (avg of Cb & Cr)")
+
+# --- NEW: color-accuracy report ---
+print(f"Color - CIEDE2000: {ciede_mean:.4f}")
+print(f"Color - AngularErr(deg): {ang_err_mean:.4f}")
+print(f"Color - SatErr: {sat_err_mean:.4f}")
+
+# --- NEW: brightness-bin table ---
+if bin_keys:
+    print("\nBrightness-Bin Table:")
+    print(f"  {'Bin':>14} | {'PSNR':>8} | {'CIEDE2000':>10} | {'SatErr':>8}")
+    for k in bin_keys:
+        nv = max(bin_sums[k]['n_valid'], 1)
+        b_psnr = bin_sums[k]['psnr'] / nv
+        b_ciede = bin_sums[k]['ciede2000'] / nv
+        b_sat = bin_sums[k]['sat_err'] / nv
+        print(f"  {k:>14} | {b_psnr:>8.3f} | {b_ciede:>10.3f} | {b_sat:>8.4f}")
+
+# --- NEW: dark & flat region report ---
+if dark_flat_ciede_list:
+    df_ciede_mean = float(np.mean(dark_flat_ciede_list))
+    df_sat_mean = float(np.mean(dark_flat_sat_list))
+    print(f"\nDarkFlat - CIEDE2000: {df_ciede_mean:.4f}")
+    print(f"DarkFlat - SatErr: {df_sat_mean:.4f}")
+else:
+    print("\nDarkFlat - No dark&flat pixels detected in this dataset/threshold.")
