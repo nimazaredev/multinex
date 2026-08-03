@@ -391,19 +391,6 @@ class ChrominanceExtractor(nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 """
 Haar-guided reliability-adaptive Multinex-Nano.
 
@@ -501,7 +488,7 @@ class HaarReliabilityEstimator(nn.Module):
 
         self.eps = float(eps)
         self.dwt = HaarDWT2D(in_channels=1)
-        self.t_k = nn.Parameter(torch.tensor(1.9459, dtype=torch.float32))
+
         self.register_buffer(
             "noise_threshold",
             torch.tensor(2.5, dtype=torch.float32),
@@ -510,7 +497,7 @@ class HaarReliabilityEstimator(nn.Module):
         
         # Trainable parameter for the uncertainty floor, replacing the fixed buffer.
         # Initialize t such that softplus(-6.9077) is approximately 1e-3.
-        self.t = nn.Parameter(torch.tensor(-0.4328, dtype=torch.float32))
+        self.t = nn.Parameter(torch.tensor(-6.9077, dtype=torch.float32))
         
         self.register_buffer(
             "rgb_to_luma",
@@ -571,19 +558,7 @@ class HaarReliabilityEstimator(nn.Module):
         # Calculate learnable tau floor
         tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
         
-       # 1. Local SNR calculation
-        snr = mu / (nu + self.eps)
-
-        # 2. Per-image Z-score standardization (completely domain-invariant for OoD)
-        snr_flat = snr.flatten(2)
-        snr_mean = snr_flat.mean(dim=-1, keepdim=True).unsqueeze(-1)
-        snr_std = snr_flat.std(dim=-1, keepdim=True).unsqueeze(-1) + self.eps
-
-        snr_norm = (snr - snr_mean) / snr_std
-
-
-        k = F.softplus(self.t_k).to(device=rgb.device, dtype=mu.dtype)
-        confidence_half = torch.sigmoid(k * snr_norm)
+        confidence_half = mu / (mu + nu + tau)
         confidence = F.interpolate(
             confidence_half,
             size=(height, width),
@@ -592,7 +567,6 @@ class HaarReliabilityEstimator(nn.Module):
         ).clamp(0.0, 1.0)
         confidence = confidence.to(dtype=output_dtype)
 
-        
         if not return_statistics:
             return confidence
 
@@ -1000,6 +974,9 @@ class MultinexNano(nn.Module):
 
     def param_count(self) -> int:
         return count_params(self)
+
+
+
 
 
 
