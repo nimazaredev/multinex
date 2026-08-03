@@ -31,7 +31,7 @@ class Dataset_PairedImage_MixedDegradation(Dataset_PairedImage):
         # Degradation application probability, sampled once per dataset
         # instance from [0.3, 0.5]; can also be re-sampled per-item if you
         # prefer per-sample randomness (see __getitem__ below).
-        self.mixed_deg_p_range = opt.get('mixed_deg_p_range', [0.3, 0.5])
+        self.mixed_deg_p_range = opt.get('mixed_deg_p_range', [0.5, 0.8])
         self.mixed_deg_scale_range = opt.get('mixed_deg_scale_range', [0.02, 0.15])
         self.mixed_deg_add_noise = opt.get('mixed_deg_add_noise', True)
         self.mixed_deg_noise_std_range = opt.get('mixed_deg_noise_std_range', [0.0, 0.02])
