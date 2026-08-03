@@ -584,6 +584,11 @@ class HaarReliabilityEstimator(nn.Module):
         ).clamp(0.0, 1.0)
         confidence = confidence.to(dtype=output_dtype)
 
+        # ------------------- دیباگ موقت -------------------
+        print(f"[DEBUG] tau value: {tau.item():.5f}")
+        print(f"[DEBUG] Mean Confidence C: {confidence.mean().item():.5f}")
+        # ---------------------------------------------------
+
         if not return_statistics:
             return confidence
 
