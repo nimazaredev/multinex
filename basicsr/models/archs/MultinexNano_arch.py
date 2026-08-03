@@ -510,7 +510,7 @@ class HaarReliabilityEstimator(nn.Module):
         
         # Trainable parameter for the uncertainty floor, replacing the fixed buffer.
         # Initialize t such that softplus(-6.9077) is approximately 1e-3.
-        self.t = nn.Parameter(torch.tensor(-1.0502, dtype=torch.float32))
+        self.t = nn.Parameter(torch.tensor(-6.9077, dtype=torch.float32))
         
         self.register_buffer(
             "rgb_to_luma",
@@ -584,11 +584,7 @@ class HaarReliabilityEstimator(nn.Module):
         ).clamp(0.0, 1.0)
         confidence = confidence.to(dtype=output_dtype)
 
-        # ------------------- دیباگ موقت -------------------
-        print(f"[DEBUG] tau value: {tau.item():.5f}")
-        print(f"[DEBUG] Mean Confidence C: {confidence.mean().item():.5f}")
-        # ---------------------------------------------------
-
+        
         if not return_statistics:
             return confidence
 
