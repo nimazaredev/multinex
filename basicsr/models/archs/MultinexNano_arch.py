@@ -501,7 +501,7 @@ class HaarReliabilityEstimator(nn.Module):
 
         self.eps = float(eps)
         self.dwt = HaarDWT2D(in_channels=1)
-
+        self.t_k = nn.Parameter(torch.tensor(1.9459, dtype=torch.float32))
         self.register_buffer(
             "noise_threshold",
             torch.tensor(2.5, dtype=torch.float32),
@@ -581,10 +581,6 @@ class HaarReliabilityEstimator(nn.Module):
 
         snr_norm = (snr - snr_mean) / snr_std
 
-        # 3. Soft sigmoidal gating with a learnable scale parameter k
-        # Learnable scale initialized to 2.0 (stored as t_k)
-        if not hasattr(self, "t_k"):
-            self.t_k = nn.Parameter(torch.tensor(2.0, dtype=torch.float32, device=rgb.device))
 
         k = F.softplus(self.t_k).to(device=rgb.device, dtype=mu.dtype)
         confidence_half = torch.sigmoid(k * snr_norm)
