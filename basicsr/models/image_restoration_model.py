@@ -354,46 +354,46 @@ class ImageCleanModel(BaseModel):
 
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
-    log_str = f'Validation {dataset_name},\t'
-    for metric, value in self.metric_results.items():
-        log_str += f'\t # {metric}: {value:.4f}'
-    logger = get_root_logger()
-    logger.info(log_str)
-
-    # --- NEW: color metrics line ---
-    if hasattr(self, 'color_metric_results'):
-        cm = self.color_metric_results
-        logger.info(
-            f'  [Color]  CIEDE2000: {cm["ciede2000"]:.4f}  '
-            f'AngularErr(deg): {cm["angular_err"]:.4f}  '
-            f'SatErr: {cm["sat_err"]:.4f}'
-        )
-
-    # --- NEW: binned table ---
-    if hasattr(self, 'bin_metric_results'):
-        logger.info('  [Brightness-Bin Table]')
-        header = f'  {"Bin":>14} | {"PSNR":>8} | {"CIEDE2000":>10} | {"SatErr":>8}'
-        logger.info(header)
-        for k, v in self.bin_metric_results.items():
-            logger.info(f'  {k:>14} | {v["psnr"]:>8.3f} | {v["ciede2000"]:>10.3f} | {v["sat_err"]:>8.4f}')
-
-    # --- NEW: dark/flat region ---
-    if hasattr(self, 'dark_flat_results'):
-        df = self.dark_flat_results
-        logger.info(
-            f'  [Dark&Flat Regions]  CIEDE2000: {df["ciede2000"]:.4f}  SatErr: {df["sat_err"]:.4f}'
-        )
-
-    if tb_logger:
+        log_str = f'Validation {dataset_name},\t'
         for metric, value in self.metric_results.items():
-            tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+            log_str += f'\t # {metric}: {value:.4f}'
+        logger = get_root_logger()
+        logger.info(log_str)
+
+        # --- NEW: color metrics line ---
         if hasattr(self, 'color_metric_results'):
-            for k, v in self.color_metric_results.items():
-                tb_logger.add_scalar(f'metrics/color_{k}', v, current_iter)
+            cm = self.color_metric_results
+            logger.info(
+                f'  [Color]  CIEDE2000: {cm["ciede2000"]:.4f}  '
+                f'AngularErr(deg): {cm["angular_err"]:.4f}  '
+                f'SatErr: {cm["sat_err"]:.4f}'
+            )
+
+        # --- NEW: binned table ---
         if hasattr(self, 'bin_metric_results'):
+            logger.info('  [Brightness-Bin Table]')
+            header = f'  {"Bin":>14} | {"PSNR":>8} | {"CIEDE2000":>10} | {"SatErr":>8}'
+            logger.info(header)
             for k, v in self.bin_metric_results.items():
-                tb_logger.add_scalar(f'metrics/bin_{k}_psnr', v['psnr'], current_iter)
-                tb_logger.add_scalar(f'metrics/bin_{k}_ciede2000', v['ciede2000'], current_iter)
+                logger.info(f'  {k:>14} | {v["psnr"]:>8.3f} | {v["ciede2000"]:>10.3f} | {v["sat_err"]:>8.4f}')
+
+        # --- NEW: dark/flat region ---
+        if hasattr(self, 'dark_flat_results'):
+            df = self.dark_flat_results
+            logger.info(
+                f'  [Dark&Flat Regions]  CIEDE2000: {df["ciede2000"]:.4f}  SatErr: {df["sat_err"]:.4f}'
+            )
+
+        if tb_logger:
+            for metric, value in self.metric_results.items():
+                tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+            if hasattr(self, 'color_metric_results'):
+                for k, v in self.color_metric_results.items():
+                    tb_logger.add_scalar(f'metrics/color_{k}', v, current_iter)
+            if hasattr(self, 'bin_metric_results'):
+                for k, v in self.bin_metric_results.items():
+                    tb_logger.add_scalar(f'metrics/bin_{k}_psnr', v['psnr'], current_iter)
+                    tb_logger.add_scalar(f'metrics/bin_{k}_ciede2000', v['ciede2000'], current_iter)
 
     def get_current_visuals(self):
         out_dict = OrderedDict()
