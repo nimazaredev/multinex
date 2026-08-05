@@ -10,7 +10,7 @@ use_amp: false
 datasets:
   train:
     name: TrainSet
-    type: Dataset_PairedImage
+    type: Dataset_PairedImage_MixedDegradation
     dataroot_gt: data/LOLv1/Train/target
     dataroot_lq: data/LOLv1/Train/input
     geometric_augs: true
