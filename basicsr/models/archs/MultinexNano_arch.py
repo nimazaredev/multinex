@@ -1023,7 +1023,7 @@ class MultinexNano(nn.Module):
                 c_adjusted, c_ach, c_chr = self._reliability_adaptive_chroma(
                     c_hat, reliability
                 )
-                luma_gate_floor = 0.4 
+                luma_gate_floor = 0.6 
                 luma_gate = luma_gate_floor + (1.0 - luma_gate_floor) * reliability
                 l_gated = luma_gate * l_hat
                 correction = c_adjusted * l_gated
