@@ -1,5 +1,5 @@
 # general settings
-name: Ablation2_BlurResidual_LOL_v1
+name: Ablation1_Baseline_LOL_v1
 model_type: ImageCleanModel
 scale: 1
 num_gpu: 1  # set num_gpu: 0 for cpu mode
@@ -10,7 +10,7 @@ use_amp: false
 datasets:
   train:
     name: TrainSet
-    type: Dataset_PairedImage_MixedDegradation
+    type: Dataset_PairedImage
     dataroot_gt: data/LOLv1/Train/target
     dataroot_lq: data/LOLv1/Train/input
     geometric_augs: true
@@ -105,11 +105,8 @@ network_g:
   # --- budget control ---
   target_params: 300        # if set (int), auto-shrink width_mult to fit budget
 
-  # --- ablation #2: blur-residual reliability instead of Haar reliability ---
-  use_haar_edge_illum: true   # activates the reliability-adaptive chromatic path
-  reliability_type: blur      # "haar" (proposed) | "blur" (this ablation)
-  blur_kernel_size: 5         # Gaussian blur kernel size used for mu = blur(Y)
-  blur_sigma: 1.0             # Gaussian blur sigma used for mu = blur(Y)
+  # --- ablation #1: original Multinex-Nano baseline (no Haar reliability path) ---
+  use_haar_edge_illum: false  # keeps the exact original Multinex-Nano behavior
 
 
 
