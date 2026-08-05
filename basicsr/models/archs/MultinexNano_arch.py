@@ -469,24 +469,15 @@ class HaarDWT2D(nn.Module):
         )
 
 
+
 class HaarReliabilityEstimator(nn.Module):
-    """
-    Fixed Haar-based reliability estimator.
-
-    The constants follow the proposal:
-        noise threshold lambda = 2.5
-        uncertainty floor tau = softplus(t) (one learned scalar)
-
-    Haar is used only to estimate reliability. It does not replace or
-    reconstruct the Multinex illumination branch.
-    """
-
-    def __init__(self, eps: float = 1e-6) -> None:
+    def __init__(self, eps: float = 1e-6, clip_details: bool = True) -> None:
         super().__init__()
         if eps <= 0:
             raise ValueError("eps must be positive")
 
         self.eps = float(eps)
+        self.clip_details = bool(clip_details)  # <-- ablation #3 switch
         self.dwt = HaarDWT2D(in_channels=1)
 
         self.register_buffer(
@@ -494,11 +485,10 @@ class HaarReliabilityEstimator(nn.Module):
             torch.tensor(2.5, dtype=torch.float32),
             persistent=True,
         )
-        
-        # Trainable parameter for the uncertainty floor, replacing the fixed buffer.
-        # Initialize t such that softplus(-6.9077) is approximately 1e-3.
+
+        # Trainable parameter for the uncertainty floor.
         self.t = nn.Parameter(torch.tensor(-6.9077, dtype=torch.float32))
-        
+
         self.register_buffer(
             "rgb_to_luma",
             torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(
@@ -509,13 +499,11 @@ class HaarReliabilityEstimator(nn.Module):
 
     @staticmethod
     def _spatial_median(x: torch.Tensor) -> torch.Tensor:
-        """Median over HxW, returned as BxCx1x1."""
         batch, channels = x.shape[:2]
         return x.flatten(2).median(dim=2).values.reshape(batch, channels, 1, 1)
 
     @staticmethod
     def _symmetric_clip(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
-        """Clip x elementwise to [-bound, bound]."""
         return torch.maximum(torch.minimum(x, bound), -bound)
 
     def forward(
@@ -531,7 +519,6 @@ class HaarReliabilityEstimator(nn.Module):
         height, width = rgb.shape[-2:]
         output_dtype = rgb.dtype
 
-        # Compute robust statistics in float32 under mixed-precision training.
         rgb_stats = rgb.float()
         luma_weights = self.rgb_to_luma.to(device=rgb.device, dtype=torch.float32)
         y = (rgb_stats * luma_weights).sum(dim=1, keepdim=True)
@@ -539,25 +526,28 @@ class HaarReliabilityEstimator(nn.Module):
         ll, hl, lh, hh = self.dwt(y)
         mu = (ll / 2.0).clamp_min(0.0)
 
-        # Robust per-image MAD estimate from HH; detached by design.
         hh_center = self._spatial_median(hh)
         mad = self._spatial_median((hh - hh_center).abs())
         sigma = (mad / 0.6745).detach()
 
         threshold = self.noise_threshold.to(device=rgb.device, dtype=mu.dtype)
         bound = threshold * sigma
-        n_hl = self._symmetric_clip(hl, bound)
-        n_lh = self._symmetric_clip(lh, bound)
-        n_hh = self._symmetric_clip(hh, bound)
+
+        if self.clip_details:
+            n_hl = self._symmetric_clip(hl, bound)
+            n_lh = self._symmetric_clip(lh, bound)
+            n_hh = self._symmetric_clip(hh, bound)
+        else:
+            # ablation #3: raw Haar detail energy, no coefficient clipping
+            n_hl, n_lh, n_hh = hl, lh, hh
 
         nu = torch.sqrt(
             (n_hl.square() + n_lh.square() + n_hh.square()) / 3.0
             + self.eps
         )
-        
-        # Calculate learnable tau floor
+
         tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
-        
+
         confidence_half = mu / (mu + nu + tau)
         confidence = F.interpolate(
             confidence_half,
@@ -580,6 +570,105 @@ class HaarReliabilityEstimator(nn.Module):
         }
         return confidence, stats
 
+
+
+class BlurResidualReliabilityEstimator(nn.Module):
+    
+
+    def __init__(
+        self,
+        eps: float = 1e-6,
+        kernel_size: int = 5,
+        blur_sigma: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd")
+
+        self.eps = float(eps)
+        self.kernel_size = int(kernel_size)
+
+        coords = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        g = torch.exp(-(coords ** 2) / (2 * blur_sigma ** 2))
+        g = g / g.sum()
+        kernel_2d = torch.outer(g, g).view(1, 1, kernel_size, kernel_size)
+        self.register_buffer("blur_kernel", kernel_2d, persistent=True)
+
+        self.register_buffer(
+            "noise_threshold",
+            torch.tensor(2.5, dtype=torch.float32),
+            persistent=True,
+        )
+        self.t = nn.Parameter(torch.tensor(-6.9077, dtype=torch.float32))
+        self.register_buffer(
+            "rgb_to_luma",
+            torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(
+                1, 3, 1, 1
+            ),
+            persistent=True,
+        )
+
+    @staticmethod
+    def _spatial_median(x: torch.Tensor) -> torch.Tensor:
+        batch, channels = x.shape[:2]
+        return x.flatten(2).median(dim=2).values.reshape(batch, channels, 1, 1)
+
+    @staticmethod
+    def _symmetric_clip(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
+        return torch.maximum(torch.minimum(x, bound), -bound)
+
+    def _blur(self, y: torch.Tensor) -> torch.Tensor:
+        pad = self.kernel_size // 2
+        y = F.pad(y, (pad, pad, pad, pad), mode="reflect")
+        kernel = self.blur_kernel.to(device=y.device, dtype=y.dtype)
+        return F.conv2d(y, kernel)
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        return_statistics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(
+                f"Expected RGB tensor with shape Bx3xHxW, got {tuple(rgb.shape)}"
+            )
+
+        output_dtype = rgb.dtype
+        rgb_stats = rgb.float()
+        luma_weights = self.rgb_to_luma.to(device=rgb.device, dtype=torch.float32)
+        y = (rgb_stats * luma_weights).sum(dim=1, keepdim=True)
+
+        mu = self._blur(y).clamp_min(0.0)
+        resid = y - mu
+
+        resid_center = self._spatial_median(resid)
+        mad = self._spatial_median((resid - resid_center).abs())
+        sigma = (mad / 0.6745).detach()
+
+        threshold = self.noise_threshold.to(device=rgb.device, dtype=mu.dtype)
+        bound = threshold * sigma
+        n_resid = self._symmetric_clip(resid, bound)
+
+        nu = torch.sqrt(n_resid.square() + self.eps)
+
+        tau = F.softplus(self.t).to(device=rgb.device, dtype=mu.dtype)
+        confidence = (mu / (mu + nu + tau)).clamp(0.0, 1.0)
+        confidence = confidence.to(dtype=output_dtype)
+
+        if not return_statistics:
+            return confidence
+
+        stats = {
+            "luminance": y.to(dtype=output_dtype),
+            "signal": mu.to(dtype=output_dtype),
+            "uncertainty": nu.to(dtype=output_dtype),
+            "noise_sigma": sigma.to(dtype=output_dtype),
+            "confidence": confidence,
+            "tau": tau.reshape(1).to(dtype=output_dtype),
+        }
+        return confidence, stats
 
 class MultinexNano(nn.Module):
     """
@@ -616,6 +705,11 @@ class MultinexNano(nn.Module):
         retinex_residual: bool = True,
         eps: float = 1e-6,
         use_haar_edge_illum: bool = False,
+        reliability_type: str = "haar",       # NEW: "haar" | "blur"  (ablation #2)
+        haar_clip_details: bool = True,       # NEW: ablation #3
+        haar_full_gating: bool = False,       # NEW: ablation #4
+        blur_kernel_size: int = 5,            # only used if reliability_type == "blur"
+        blur_sigma: float = 1.0,              # only used if reliability_type == "blur"
     ) -> None:
         super().__init__()
         if in_ch != 3 or out_ch != 3:
@@ -625,6 +719,8 @@ class MultinexNano(nn.Module):
             )
         if illum_mid < 0 or chroma_mid < 0:
             raise ValueError("illum_mid and chroma_mid must be non-negative")
+        if reliability_type not in ("haar", "blur"):
+            raise ValueError(f"Unsupported reliability_type: {reliability_type}")
 
         self.use_depthwise = bool(use_depthwise)
         self.per_illum_proj = bool(per_illum_proj)
@@ -639,10 +735,11 @@ class MultinexNano(nn.Module):
         self.retinex_residual = bool(retinex_residual)
         self.use_illum_attn = bool(use_illum_attn)
         self.use_chroma_attn = bool(use_chroma_attn)
-        
-        # Flag is read normally, relying on the YAML parser to provide a boolean.
+
         self.use_haar_edge_illum = bool(use_haar_edge_illum)
-        
+        self.reliability_type = str(reliability_type)
+        self.haar_full_gating = bool(haar_full_gating)
+
         self.illum_mid = int(illum_mid)
         self.chroma_mid = int(chroma_mid)
         self.out_ch = int(out_ch)
@@ -655,12 +752,19 @@ class MultinexNano(nn.Module):
             self.K_L = self.illum_extractor(dummy).shape[1]
             self.K_C = self.chroma_extractor(dummy).shape[1]
 
-        # This module exists only when the existing YAML flag is True.
-        self.haar_reliability = (
-            HaarReliabilityEstimator(eps=self.eps)
-            if self.use_haar_edge_illum
-            else None
-        )
+        # Pick the reliability estimator (only exists when the flag is on).
+        self.reliability_estimator = None
+        if self.use_haar_edge_illum:
+            if self.reliability_type == "haar":
+                self.reliability_estimator = HaarReliabilityEstimator(
+                    eps=self.eps, clip_details=haar_clip_details
+                )
+            else:  # "blur"  -> ablation #2
+                self.reliability_estimator = BlurResidualReliabilityEstimator(
+                    eps=self.eps,
+                    kernel_size=blur_kernel_size,
+                    blur_sigma=blur_sigma,
+                )
 
         channels = max(3, int(round(self.base_channels * self.width_mult)))
         self._build_width_dependent_modules(channels)
@@ -882,68 +986,53 @@ class MultinexNano(nn.Module):
         rgb_in = x
         l_stack, c_stack = self._extract_stacks(x)
 
-        # Original Multinex illumination branch is always preserved.
         f_l = self._forward_branch(
-            l_stack,
-            self.illum_stem,
-            self.illum_att,
-            self.illum_att_proj,
-            self.illum_mid_seq,
-            self.use_illum_attn,
+            l_stack, self.illum_stem, self.illum_att,
+            self.illum_att_proj, self.illum_mid_seq, self.use_illum_attn,
         )
-        l_hat = self._apply_head_act(
-            self.head_luma(f_l),
-            self.luma_head_act,
-        )
+        l_hat = self._apply_head_act(self.head_luma(f_l), self.luma_head_act)
 
-        # Original Multinex reflectance/chromatic branch.
         f_c = self._forward_branch(
-            c_stack,
-            self.chroma_stem,
-            self.chroma_att,
-            self.chroma_att_proj,
-            self.chroma_mid_seq,
-            self.use_chroma_attn,
+            c_stack, self.chroma_stem, self.chroma_att,
+            self.chroma_att_proj, self.chroma_mid_seq, self.use_chroma_attn,
         )
-        c_hat = self._apply_head_act(
-            self.head_chroma(f_c),
-            self.chroma_head_act,
-        )
+        c_hat = self._apply_head_act(self.head_chroma(f_c), self.chroma_head_act)
 
-        # The existing flag directly activates the proposed contribution.
         if self.use_haar_edge_illum:
-            if self.haar_reliability is None:
+            if self.reliability_estimator is None:
                 raise RuntimeError(
-                    "use_haar_edge_illum=True but Haar reliability was not initialized"
+                    "use_haar_edge_illum=True but no reliability estimator was initialized"
                 )
 
             if return_aux:
-                reliability, reliability_stats = self.haar_reliability(
-                    x,
-                    return_statistics=True,
+                reliability, reliability_stats = self.reliability_estimator(
+                    x, return_statistics=True
                 )
             else:
-                reliability = self.haar_reliability(x)
+                reliability = self.reliability_estimator(x)
                 reliability_stats = None
 
-            c_adjusted, c_ach, c_chr = self._reliability_adaptive_chroma(
-                c_hat,
-                reliability,
-            )
+            if self.haar_full_gating:
+                # ablation #4: full residual gating, I_hat = I + C * (Delta_L * Delta_R)
+                c_adjusted = c_hat  # no achromatic/chromatic split
+                correction = reliability * (c_hat * l_hat)
+                c_ach = c_hat.mean(dim=1, keepdim=True)
+                c_chr = c_hat - c_ach
+            else:
+                # proposed method: chromatic-only gating
+                c_adjusted, c_ach, c_chr = self._reliability_adaptive_chroma(
+                    c_hat, reliability
+                )
+                correction = c_adjusted * l_hat
         else:
-            # Exact original baseline behavior.
-            reliability = x.new_ones(
-                x.shape[0],
-                1,
-                x.shape[2],
-                x.shape[3],
-            )
+            # baseline: exact original Multinex-Nano behavior
+            reliability = x.new_ones(x.shape[0], 1, x.shape[2], x.shape[3])
             reliability_stats = None
             c_adjusted = c_hat
             c_ach = c_hat.mean(dim=1, keepdim=True)
             c_chr = c_hat - c_ach
+            correction = c_adjusted * l_hat
 
-        correction = c_adjusted * l_hat
         output = rgb_in + correction if self.retinex_residual else correction
 
         if not return_aux:
@@ -951,9 +1040,11 @@ class MultinexNano(nn.Module):
 
         aux = {
             "haar_method_enabled": torch.tensor(
-                float(self.use_haar_edge_illum),
-                device=x.device,
-                dtype=x.dtype,
+                float(self.use_haar_edge_illum), device=x.device, dtype=x.dtype
+            ),
+            "reliability_type": self.reliability_type,
+            "full_gating": torch.tensor(
+                float(self.haar_full_gating), device=x.device, dtype=x.dtype
             ),
             "reliability": reliability,
             "luma_correction": l_hat,
@@ -964,14 +1055,9 @@ class MultinexNano(nn.Module):
             "image_correction": correction,
         }
         if reliability_stats is not None:
-            aux.update(
-                {
-                    f"haar_{key}": value
-                    for key, value in reliability_stats.items()
-                }
-            )
+            aux.update({f"reliability_{k}": v for k, v in reliability_stats.items()})
         return output, aux
-
+    
     def param_count(self) -> int:
         return count_params(self)
 
